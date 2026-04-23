@@ -54,8 +54,8 @@ Ask the user what they want to track. Either:
 - Define a custom recipe with: source queries, classification rules, extraction schema,
   tracker page path, tracker format
 
-Recipes are YAML files at `~/.gbrain/recipes/{name}.yaml`. Use `gbrain research init`
-to scaffold a new one.
+Recipes are YAML files at `~/.gbrain/recipes/{name}.yaml`. Create a new one
+by authoring the YAML directly or copying an existing recipe as a starting point.
 
 ### Phase 2: Search Sources
 
