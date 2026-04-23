@@ -8,6 +8,7 @@
 
 import { statSync, readFileSync } from 'fs';
 import { basename, extname } from 'path';
+import { getTranscriptionConfig } from './provider-config.ts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -29,11 +30,19 @@ export interface TranscriptionResult {
 }
 
 export interface TranscriptionConfig {
-  provider?: 'groq' | 'openai' | 'deepgram';
+  provider?: string;
   apiKey?: string;
+  baseURL?: string;
   model?: string;
   language?: string;
   diarize?: boolean;
+}
+
+interface ResolvedTranscriptionConfig {
+  provider: string;
+  apiKey?: string;
+  baseURL: string;
+  model: string;
 }
 
 const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
@@ -63,10 +72,10 @@ export async function transcribe(
   }
 
   // Determine provider and API key
-  const provider = config.provider || detectProvider();
-  const apiKey = config.apiKey || getApiKey(provider);
+  const resolved = resolveTranscriptionConfig(config);
+  const { provider, apiKey } = resolved;
   if (!apiKey) {
-    const envVar = provider === 'groq' ? 'GROQ_API_KEY' : 'OPENAI_API_KEY';
+    const envVar = getApiKeyEnvVar(provider);
     throw new Error(
       `${provider} API key not set. Set ${envVar} environment variable. ` +
       (provider === 'groq' ? 'Or set OPENAI_API_KEY to use OpenAI Whisper as fallback.' : '')
@@ -75,11 +84,11 @@ export async function transcribe(
 
   // Handle large files via segmentation
   if (stat.size > MAX_FILE_SIZE) {
-    return transcribeLargeFile(audioPath, provider, apiKey, config);
+    return transcribeLargeFile(audioPath, resolved, config);
   }
 
   // Single file transcription
-  return transcribeFile(audioPath, provider, apiKey, config);
+  return transcribeFile(audioPath, resolved, config);
 }
 
 // ---------------------------------------------------------------------------
@@ -101,20 +110,46 @@ function getApiKey(provider: string): string | undefined {
   }
 }
 
+function getApiKeyEnvVar(provider: string): string {
+  switch (provider) {
+    case 'groq': return 'GROQ_API_KEY';
+    case 'deepgram': return 'DEEPGRAM_API_KEY';
+    default: return 'OPENAI_API_KEY';
+  }
+}
+
+function getDefaultModel(provider: string): string {
+  return provider === 'groq' ? 'whisper-large-v3' : 'whisper-1';
+}
+
+function getDefaultBaseUrl(provider: string): string {
+  return provider === 'groq'
+    ? 'https://api.groq.com/openai/v1'
+    : 'https://api.openai.com/v1';
+}
+
+function resolveTranscriptionConfig(config: TranscriptionConfig): ResolvedTranscriptionConfig {
+  const providerConfig = getTranscriptionConfig();
+  const provider = config.provider ?? providerConfig.provider ?? detectProvider();
+
+  return {
+    provider,
+    apiKey: config.apiKey ?? providerConfig.apiKey ?? getApiKey(provider),
+    baseURL: config.baseURL ?? providerConfig.baseURL ?? getDefaultBaseUrl(provider),
+    model: config.model ?? providerConfig.model ?? getDefaultModel(provider),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Single file transcription
 // ---------------------------------------------------------------------------
 
 async function transcribeFile(
   audioPath: string,
-  provider: string,
-  apiKey: string,
+  resolved: ResolvedTranscriptionConfig,
   config: TranscriptionConfig,
 ): Promise<TranscriptionResult> {
-  const model = config.model || (provider === 'groq' ? 'whisper-large-v3' : 'whisper-1');
-  const baseUrl = provider === 'groq'
-    ? 'https://api.groq.com/openai/v1'
-    : 'https://api.openai.com/v1';
+  const { provider, apiKey, baseURL, model } = resolved;
 
   // Both Groq and OpenAI use the same API format
   const fileData = readFileSync(audioPath);
@@ -124,7 +159,7 @@ async function transcribeFile(
   formData.append('response_format', 'verbose_json');
   if (config.language) formData.append('language', config.language);
 
-  const response = await fetch(`${baseUrl}/audio/transcriptions`, {
+  const response = await fetch(`${baseURL}/audio/transcriptions`, {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${apiKey}` },
     body: formData,
@@ -156,10 +191,10 @@ async function transcribeFile(
 
 async function transcribeLargeFile(
   audioPath: string,
-  provider: string,
-  apiKey: string,
+  resolved: ResolvedTranscriptionConfig,
   config: TranscriptionConfig,
 ): Promise<TranscriptionResult> {
+  const { provider } = resolved;
   // Check ffmpeg availability
   const ffmpegAvailable = await checkFfmpeg();
   if (!ffmpegAvailable) {
@@ -201,7 +236,7 @@ async function transcribeLargeFile(
 
     for (const seg of segments) {
       const segPath = `${tmpDir}/${seg}`;
-      const result = await transcribeFile(segPath, provider, apiKey, config);
+      const result = await transcribeFile(segPath, resolved, config);
       // Offset timestamps
       result.segments = result.segments.map(s => ({
         ...s,
