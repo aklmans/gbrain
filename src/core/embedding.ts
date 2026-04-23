@@ -38,6 +38,11 @@ export function getEmbeddingRuntimeConfig(): { model: string; dimensions: number
   };
 }
 
+export function resetEmbeddingClientForTests(): void {
+  client = null;
+  clientCacheKey = null;
+}
+
 function getClient(): OpenAI {
   const options = getEmbeddingClientOptions();
   const cacheKey = JSON.stringify({

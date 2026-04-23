@@ -46,7 +46,10 @@ mock.module('openai', () => {
 
 const embeddingModulePromise = import('../src/core/embedding.ts');
 
-beforeEach(() => {
+beforeEach(async () => {
+  const { resetEmbeddingClientForTests } = await embeddingModulePromise;
+  resetEmbeddingClientForTests();
+
   envSnapshot = new Map<string, string | undefined>();
   for (const key of ENV_KEYS) {
     envSnapshot.set(key, process.env[key]);
@@ -116,6 +119,39 @@ describe('embedding provider config wiring', () => {
         model: 'kimi-embedding-v1',
         input: ['alpha', 'beta'],
         dimensions: 1024,
+      },
+    ]);
+  });
+
+  test('embedBatch reuses the cached client when resolved client options stay the same', async () => {
+    const { embedBatch, resetEmbeddingClientForTests } = await embeddingModulePromise;
+
+    resetEmbeddingClientForTests();
+    process.env.GBRAIN_EMBED_API_KEY = 'embed-key';
+    process.env.GBRAIN_EMBED_BASE_URL = 'https://embed.example/v1';
+    process.env.GBRAIN_EMBED_MODEL = 'model-one';
+    process.env.GBRAIN_EMBED_DIMENSIONS = '1024';
+
+    await embedBatch(['first']);
+
+    process.env.GBRAIN_EMBED_MODEL = 'model-two';
+    process.env.GBRAIN_EMBED_DIMENSIONS = '2048';
+
+    await embedBatch(['second']);
+
+    expect(constructorCalls).toEqual([
+      { apiKey: 'embed-key', baseURL: 'https://embed.example/v1' },
+    ]);
+    expect(requestCalls).toEqual([
+      {
+        model: 'model-one',
+        input: ['first'],
+        dimensions: 1024,
+      },
+      {
+        model: 'model-two',
+        input: ['second'],
+        dimensions: 2048,
       },
     ]);
   });
