@@ -8,6 +8,7 @@
  */
 
 import OpenAI from 'openai';
+import { getEmbeddingConfig } from './provider-config.ts';
 
 const MODEL = 'text-embedding-3-large';
 const DIMENSIONS = 1536;
@@ -18,11 +19,37 @@ const MAX_DELAY_MS = 120000;
 const BATCH_SIZE = 100;
 
 let client: OpenAI | null = null;
+let clientCacheKey: string | null = null;
+
+export function getEmbeddingClientOptions(): ConstructorParameters<typeof OpenAI>[0] {
+  const config = getEmbeddingConfig();
+
+  return {
+    ...(config.apiKey ? { apiKey: config.apiKey } : {}),
+    ...(config.baseURL ? { baseURL: config.baseURL } : {}),
+  };
+}
+
+export function getEmbeddingRuntimeConfig(): { model: string; dimensions: number } {
+  const config = getEmbeddingConfig();
+  return {
+    model: config.model,
+    dimensions: config.dimensions,
+  };
+}
 
 function getClient(): OpenAI {
-  if (!client) {
-    client = new OpenAI();
+  const options = getEmbeddingClientOptions();
+  const cacheKey = JSON.stringify({
+    apiKey: options?.apiKey,
+    baseURL: options?.baseURL,
+  });
+
+  if (!client || clientCacheKey !== cacheKey) {
+    client = new OpenAI(options);
+    clientCacheKey = cacheKey;
   }
+
   return client;
 }
 
@@ -62,10 +89,11 @@ export async function embedBatch(
 async function embedBatchWithRetry(texts: string[]): Promise<Float32Array[]> {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
+      const runtime = getEmbeddingRuntimeConfig();
       const response = await getClient().embeddings.create({
-        model: MODEL,
+        model: runtime.model,
         input: texts,
-        dimensions: DIMENSIONS,
+        dimensions: runtime.dimensions,
       });
 
       // Sort by index to maintain order
