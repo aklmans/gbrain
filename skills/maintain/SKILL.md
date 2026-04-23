@@ -161,7 +161,8 @@ Available link types (use with `gbrain graph-query --type`):
 
 Going forward, every `gbrain put` call auto-creates and reconciles links via the
 auto-link post-hook (default on; disable: `gbrain config set auto_link false`).
-So link-extract is mostly a one-time backfill. timeline-extract should be re-run
+So `gbrain extract links --source db` is mostly a one-time backfill.
+`gbrain extract timeline --source db` should be re-run
 after bulk imports or content edits that add new dated entries.
 
 ### Embedding freshness

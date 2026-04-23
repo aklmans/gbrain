@@ -290,7 +290,7 @@ export const MIGRATIONS: Migration[] = [
     // Removes the trigger that updates pages.updated_at on every timeline_entries insert.
     // Structured timeline_entries are now graph data (queryable dates), not search text.
     // pages.timeline (markdown) still feeds the page search_vector via trg_pages_search_vector.
-    // Removing this trigger also fixes a mutation-induced reordering bug in timeline-extract
+    // Removing this trigger also fixes a mutation-induced reordering bug in timeline extraction
     // pagination (listPages ORDER BY updated_at DESC drifted as inserts touched pages).
     sql: `
       DROP TRIGGER IF EXISTS trg_timeline_search_vector ON timeline_entries;
