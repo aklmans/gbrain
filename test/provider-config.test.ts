@@ -16,7 +16,6 @@ const ENV_KEYS = [
   'GBRAIN_OPENAI_MODEL',
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
-  'OPENAI_MODEL',
   'GBRAIN_QUERY_EXPANSION_API_KEY',
   'GBRAIN_QUERY_EXPANSION_BASE_URL',
   'GBRAIN_QUERY_EXPANSION_MODEL',
@@ -25,7 +24,6 @@ const ENV_KEYS = [
   'GBRAIN_ANTHROPIC_MODEL',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_MODEL',
   'GBRAIN_SUBAGENT_API_KEY',
   'GBRAIN_SUBAGENT_BASE_URL',
   'GBRAIN_SUBAGENT_MODEL',
@@ -52,7 +50,6 @@ describe('provider-config', () => {
   test('embedding prefers GBRAIN_EMBED_* over shared OpenAI envs', () => {
     process.env.OPENAI_API_KEY = 'openai-key';
     process.env.OPENAI_BASE_URL = 'https://openai.example/v1';
-    process.env.OPENAI_MODEL = 'openai-model';
     process.env.GBRAIN_OPENAI_API_KEY = 'gbrain-openai-key';
     process.env.GBRAIN_OPENAI_BASE_URL = 'https://gbrain-openai.example/v1';
     process.env.GBRAIN_OPENAI_MODEL = 'gbrain-openai-model';
@@ -81,7 +78,6 @@ describe('provider-config', () => {
   test('query expansion prefers scoped envs over shared Anthropic envs', () => {
     process.env.ANTHROPIC_API_KEY = 'anthropic-key';
     process.env.ANTHROPIC_BASE_URL = 'https://anthropic.example';
-    process.env.ANTHROPIC_MODEL = 'anthropic-model';
     process.env.GBRAIN_ANTHROPIC_API_KEY = 'gbrain-anthropic-key';
     process.env.GBRAIN_ANTHROPIC_BASE_URL = 'https://gbrain-anthropic.example';
     process.env.GBRAIN_ANTHROPIC_MODEL = 'gbrain-anthropic-model';
@@ -107,7 +103,6 @@ describe('provider-config', () => {
   test('subagent prefers scoped envs over shared Anthropic envs', () => {
     process.env.ANTHROPIC_API_KEY = 'anthropic-key';
     process.env.ANTHROPIC_BASE_URL = 'https://anthropic.example';
-    process.env.ANTHROPIC_MODEL = 'anthropic-model';
     process.env.GBRAIN_ANTHROPIC_API_KEY = 'gbrain-anthropic-key';
     process.env.GBRAIN_ANTHROPIC_BASE_URL = 'https://gbrain-anthropic.example';
     process.env.GBRAIN_ANTHROPIC_MODEL = 'gbrain-anthropic-model';

@@ -42,7 +42,6 @@ export function getEmbeddingConfig(): EmbeddingConfig {
     model: firstNonEmpty(
       process.env.GBRAIN_EMBED_MODEL,
       process.env.GBRAIN_OPENAI_MODEL,
-      process.env.OPENAI_MODEL,
     ) ?? 'text-embedding-3-large',
     dimensions: parseIntOr(process.env.GBRAIN_EMBED_DIMENSIONS, 1536),
   };
@@ -63,7 +62,6 @@ export function getQueryExpansionConfig(): AnthropicConfig {
     model: firstNonEmpty(
       process.env.GBRAIN_QUERY_EXPANSION_MODEL,
       process.env.GBRAIN_ANTHROPIC_MODEL,
-      process.env.ANTHROPIC_MODEL,
     ) ?? 'claude-haiku-4-5-20251001',
   };
 }
@@ -83,7 +81,6 @@ export function getSubagentConfig(): AnthropicConfig {
     model: firstNonEmpty(
       process.env.GBRAIN_SUBAGENT_MODEL,
       process.env.GBRAIN_ANTHROPIC_MODEL,
-      process.env.ANTHROPIC_MODEL,
     ) ?? 'claude-sonnet-4-6',
   };
 }
