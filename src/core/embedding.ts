@@ -30,11 +30,12 @@ export function getEmbeddingClientOptions(): ConstructorParameters<typeof OpenAI
   };
 }
 
-export function getEmbeddingRuntimeConfig(): { model: string; dimensions: number } {
+export function getEmbeddingRuntimeConfig(): { model: string; dimensions: number; batchSize: number } {
   const config = getEmbeddingConfig();
   return {
     model: config.model,
     dimensions: config.dimensions,
+    batchSize: config.batchSize,
   };
 }
 
@@ -80,9 +81,12 @@ export async function embedBatch(
   const truncated = texts.map(t => t.slice(0, MAX_CHARS));
   const results: Float32Array[] = [];
 
-  // Process in batches of BATCH_SIZE
-  for (let i = 0; i < truncated.length; i += BATCH_SIZE) {
-    const batch = truncated.slice(i, i + BATCH_SIZE);
+  const runtime = getEmbeddingRuntimeConfig();
+  const batchSize = runtime.batchSize > 0 ? runtime.batchSize : BATCH_SIZE;
+
+  // Process in batches of batchSize
+  for (let i = 0; i < truncated.length; i += batchSize) {
+    const batch = truncated.slice(i, i + batchSize);
     const batchResults = await embedBatchWithRetry(batch);
     results.push(...batchResults);
     options.onBatchComplete?.(results.length, truncated.length);

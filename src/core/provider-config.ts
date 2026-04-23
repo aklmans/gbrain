@@ -3,6 +3,7 @@ export interface EmbeddingConfig {
   baseURL?: string;
   model: string;
   dimensions: number;
+  batchSize: number;
 }
 
 export interface AnthropicConfig {
@@ -51,6 +52,7 @@ export function getEmbeddingConfig(): EmbeddingConfig {
       process.env.GBRAIN_OPENAI_MODEL,
     ) ?? 'text-embedding-3-large',
     dimensions: parseIntOr(process.env.GBRAIN_EMBED_DIMENSIONS, 1536),
+    batchSize: parseIntOr(process.env.GBRAIN_EMBED_BATCH_SIZE, 100),
   };
 }
 

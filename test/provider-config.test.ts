@@ -11,6 +11,7 @@ const ENV_KEYS = [
   'GBRAIN_EMBED_BASE_URL',
   'GBRAIN_EMBED_MODEL',
   'GBRAIN_EMBED_DIMENSIONS',
+  'GBRAIN_EMBED_BATCH_SIZE',
   'GBRAIN_OPENAI_API_KEY',
   'GBRAIN_OPENAI_BASE_URL',
   'GBRAIN_OPENAI_MODEL',
@@ -64,12 +65,14 @@ describe('provider-config', () => {
     process.env.GBRAIN_EMBED_BASE_URL = 'https://embed.example/v1';
     process.env.GBRAIN_EMBED_MODEL = 'embed-model';
     process.env.GBRAIN_EMBED_DIMENSIONS = '2048';
+    process.env.GBRAIN_EMBED_BATCH_SIZE = '10';
 
     expect(getEmbeddingConfig()).toEqual({
       apiKey: 'embed-key',
       baseURL: 'https://embed.example/v1',
       model: 'embed-model',
       dimensions: 2048,
+      batchSize: 10,
     });
   });
 
@@ -83,6 +86,7 @@ describe('provider-config', () => {
       baseURL: 'https://gbrain-openai.example/v1',
       model: 'gbrain-openai-model',
       dimensions: 1536,
+      batchSize: 100,
     });
   });
 
@@ -95,6 +99,7 @@ describe('provider-config', () => {
       baseURL: 'https://openai.example/v1',
       model: 'text-embedding-3-large',
       dimensions: 1536,
+      batchSize: 100,
     });
   });
 
@@ -106,12 +111,14 @@ describe('provider-config', () => {
     process.env.GBRAIN_EMBED_MODEL = ' ';
     process.env.GBRAIN_OPENAI_MODEL = 'gbrain-openai-model';
     process.env.GBRAIN_EMBED_DIMENSIONS = '1536x';
+    process.env.GBRAIN_EMBED_BATCH_SIZE = '10x';
 
     expect(getEmbeddingConfig()).toEqual({
       apiKey: 'gbrain-openai-key',
       baseURL: 'https://openai.example/v1',
       model: 'gbrain-openai-model',
       dimensions: 1536,
+      batchSize: 100,
     });
   });
 
@@ -119,12 +126,14 @@ describe('provider-config', () => {
     process.env.GBRAIN_EMBED_API_KEY = '  embed-key  ';
     process.env.GBRAIN_EMBED_BASE_URL = '  https://embed.example/v1  ';
     process.env.GBRAIN_EMBED_MODEL = '  embed-model  ';
+    process.env.GBRAIN_EMBED_BATCH_SIZE = ' 10 ';
 
     expect(getEmbeddingConfig()).toEqual({
       apiKey: 'embed-key',
       baseURL: 'https://embed.example/v1',
       model: 'embed-model',
       dimensions: 1536,
+      batchSize: 10,
     });
   });
 
@@ -134,6 +143,7 @@ describe('provider-config', () => {
       baseURL: undefined,
       model: 'text-embedding-3-large',
       dimensions: 1536,
+      batchSize: 100,
     });
   });
 
