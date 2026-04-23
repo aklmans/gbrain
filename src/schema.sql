@@ -342,7 +342,7 @@ CREATE TRIGGER trg_pages_search_vector
 -- The markdown timeline section in pages.timeline still feeds search_vector via
 -- the trg_pages_search_vector trigger above. Removing the timeline_entries
 -- trigger avoids double-weighting the same content in search and prevents
--- mutation-induced reordering during timeline-extract pagination.
+-- mutation-induced reordering during timeline extraction pagination.
 DROP TRIGGER IF EXISTS trg_timeline_search_vector ON timeline_entries;
 DROP FUNCTION IF EXISTS update_page_search_vector_from_timeline();
 

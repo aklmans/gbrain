@@ -3,7 +3,7 @@
  *
  * Runs the full pipeline against in-memory PGLite (no API keys, no external DB).
  *   1. Seed pages with entity refs and timeline content
- *   2. Run link-extract + timeline-extract
+ *   2. Run extract links + extract timeline
  *   3. Verify graph populated
  *   4. Test auto-link via put_page operation handler
  *   5. Test reconciliation (edit page, stale links removed)
@@ -46,7 +46,7 @@ function makeContext(): OperationContext {
 describe('E2E graph quality (v0.10.1 pipeline)', () => {
   beforeEach(truncateAll, 15_000);
 
-  test('full pipeline: seed -> link-extract -> timeline-extract -> verify', async () => {
+  test('full pipeline: seed -> extract links -> extract timeline -> verify', async () => {
     // Seed 5 pages with entity refs and timeline content.
     await engine.putPage('people/alice', {
       type: 'person', title: 'Alice',

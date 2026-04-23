@@ -90,4 +90,10 @@ describe('doctor command', () => {
     expect(source).toMatch(/table:\s*'ingest_log'.*col:\s*'pages_updated'/);
     expect(source).toMatch(/table:\s*'files'.*col:\s*'metadata'/);
   });
+
+  test('doctor graph coverage remediation points to extract subcommands', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    expect(source).toContain('gbrain extract links --source db && gbrain extract timeline --source db');
+    expect(source).not.toContain('gbrain link-extract && gbrain timeline-extract');
+  });
 });

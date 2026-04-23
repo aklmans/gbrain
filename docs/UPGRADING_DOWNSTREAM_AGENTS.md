@@ -318,7 +318,7 @@ v0.13 edges carry new `link_type` values. If your fork has graph-query skills th
 
 ### Type normalization NOT in v0.13
 
-Legacy rows with `link_type='attendee'` or `link_type='mention'` coexist with new `'attended'` / `'mentions'` rows. Your queries filtering on old type names keep working. A separate opt-in `gbrain normalize-types` command in v0.14 handles the rename.
+Legacy rows with `link_type='attendee'` or `link_type='mention'` coexist with new `'attended'` / `'mentions'` rows. Your queries filtering on old type names keep working. No standalone normalization CLI ships in the current build, so treat the legacy values as backward-compatible aliases unless you choose to rewrite them yourself.
 ## v0.14.0 shell jobs (optional adoption, no skill edits)
 
 Adds a `shell` job type to Minions so deterministic cron scripts (API fetch, token

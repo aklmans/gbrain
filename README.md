@@ -296,7 +296,7 @@ GBrain ships integration recipes that your agent sets up for you. Each recipe te
 | [Calendar-to-Brain](recipes/calendar-to-brain.md) | credential-gateway | Google Calendar to searchable daily pages |
 | [Meeting Sync](recipes/meeting-sync.md) | — | Circleback transcripts to brain pages with attendees |
 
-**Data research recipes** extract structured data from email into tracked brain pages. Built-in recipes for investor updates (MRR, ARR, runway, headcount), expense tracking, and company metrics. Create your own with `gbrain research init`.
+**Data research recipes** extract structured data from email into tracked brain pages. Built-in recipes for investor updates (MRR, ARR, runway, headcount), expense tracking, and company metrics. Create your own by authoring a YAML recipe in `~/.gbrain/recipes/`.
 
 Run `gbrain integrations` to see status.
 
@@ -571,9 +571,9 @@ ADMIN
   gbrain lint [--fix]                   LLM artifact detection
   gbrain repair-jsonb [--dry-run]       Repair v0.12.0 double-encoded JSONB (Postgres)
   gbrain orphans [--json] [--count]     Find pages with zero inbound wikilinks
-  gbrain transcribe <audio>             Transcribe audio (Groq Whisper)
-  gbrain research init <name>           Scaffold a data-research recipe
-  gbrain research list                  Show available recipes
+  gbrain health                         Brain health dashboard
+  gbrain skillpack-check [--quiet]      Cron-friendly health + migration gate
+  gbrain post-upgrade                   Print upgrade notes + run pending migrations
 ```
 
 Run `gbrain --help` for the full reference.
