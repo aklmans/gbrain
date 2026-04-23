@@ -19,11 +19,13 @@ export interface TranscriptionProviderConfig {
 }
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
-  return values.find(value => typeof value === 'string' && value.length > 0);
+  return values.find(value => typeof value === 'string' && value.trim().length > 0);
 }
 
 function parseIntOr(raw: string | undefined, fallback: number): number {
-  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  const normalized = raw?.trim();
+  if (!normalized || !/^\d+$/.test(normalized)) return fallback;
+  const parsed = Number.parseInt(normalized, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 

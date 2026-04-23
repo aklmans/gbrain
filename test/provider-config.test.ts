@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   getEmbeddingConfig,
   getQueryExpansionConfig,
@@ -35,8 +35,15 @@ const ENV_KEYS = [
   'DEEPGRAM_API_KEY',
 ] as const;
 
-const envSnapshot = new Map<string, string | undefined>();
-for (const key of ENV_KEYS) envSnapshot.set(key, process.env[key]);
+let envSnapshot = new Map<string, string | undefined>();
+
+beforeEach(() => {
+  envSnapshot = new Map<string, string | undefined>();
+  for (const key of ENV_KEYS) {
+    envSnapshot.set(key, process.env[key]);
+    delete process.env[key];
+  }
+});
 
 afterEach(() => {
   for (const key of ENV_KEYS) {
@@ -66,6 +73,48 @@ describe('provider-config', () => {
     });
   });
 
+  test('embedding falls back to GBRAIN_OPENAI_* when embed-specific envs are unset', () => {
+    process.env.GBRAIN_OPENAI_API_KEY = 'gbrain-openai-key';
+    process.env.GBRAIN_OPENAI_BASE_URL = 'https://gbrain-openai.example/v1';
+    process.env.GBRAIN_OPENAI_MODEL = 'gbrain-openai-model';
+
+    expect(getEmbeddingConfig()).toEqual({
+      apiKey: 'gbrain-openai-key',
+      baseURL: 'https://gbrain-openai.example/v1',
+      model: 'gbrain-openai-model',
+      dimensions: 1536,
+    });
+  });
+
+  test('embedding falls back to OPENAI_* for apiKey/baseURL and keeps default model', () => {
+    process.env.OPENAI_API_KEY = 'openai-key';
+    process.env.OPENAI_BASE_URL = 'https://openai.example/v1';
+
+    expect(getEmbeddingConfig()).toEqual({
+      apiKey: 'openai-key',
+      baseURL: 'https://openai.example/v1',
+      model: 'text-embedding-3-large',
+      dimensions: 1536,
+    });
+  });
+
+  test('embedding ignores whitespace-only envs and malformed dimensions', () => {
+    process.env.GBRAIN_EMBED_API_KEY = '   ';
+    process.env.GBRAIN_OPENAI_API_KEY = 'gbrain-openai-key';
+    process.env.GBRAIN_EMBED_BASE_URL = '\t';
+    process.env.OPENAI_BASE_URL = 'https://openai.example/v1';
+    process.env.GBRAIN_EMBED_MODEL = ' ';
+    process.env.GBRAIN_OPENAI_MODEL = 'gbrain-openai-model';
+    process.env.GBRAIN_EMBED_DIMENSIONS = '1536x';
+
+    expect(getEmbeddingConfig()).toEqual({
+      apiKey: 'gbrain-openai-key',
+      baseURL: 'https://openai.example/v1',
+      model: 'gbrain-openai-model',
+      dimensions: 1536,
+    });
+  });
+
   test('embedding preserves current defaults when unset', () => {
     expect(getEmbeddingConfig()).toEqual({
       apiKey: undefined,
@@ -92,6 +141,29 @@ describe('provider-config', () => {
     });
   });
 
+  test('query expansion falls back to GBRAIN_ANTHROPIC_* when scoped envs are unset', () => {
+    process.env.GBRAIN_ANTHROPIC_API_KEY = 'gbrain-anthropic-key';
+    process.env.GBRAIN_ANTHROPIC_BASE_URL = 'https://gbrain-anthropic.example';
+    process.env.GBRAIN_ANTHROPIC_MODEL = 'gbrain-anthropic-model';
+
+    expect(getQueryExpansionConfig()).toEqual({
+      apiKey: 'gbrain-anthropic-key',
+      baseURL: 'https://gbrain-anthropic.example',
+      model: 'gbrain-anthropic-model',
+    });
+  });
+
+  test('query expansion falls back to ANTHROPIC_* for apiKey/baseURL and keeps default model', () => {
+    process.env.ANTHROPIC_API_KEY = 'anthropic-key';
+    process.env.ANTHROPIC_BASE_URL = 'https://anthropic.example';
+
+    expect(getQueryExpansionConfig()).toEqual({
+      apiKey: 'anthropic-key',
+      baseURL: 'https://anthropic.example',
+      model: 'claude-haiku-4-5-20251001',
+    });
+  });
+
   test('query expansion preserves current default model when unset', () => {
     expect(getQueryExpansionConfig()).toEqual({
       apiKey: undefined,
@@ -114,6 +186,29 @@ describe('provider-config', () => {
       apiKey: 'subagent-key',
       baseURL: 'https://subagent.example',
       model: 'subagent-model',
+    });
+  });
+
+  test('subagent falls back to GBRAIN_ANTHROPIC_* when scoped envs are unset', () => {
+    process.env.GBRAIN_ANTHROPIC_API_KEY = 'gbrain-anthropic-key';
+    process.env.GBRAIN_ANTHROPIC_BASE_URL = 'https://gbrain-anthropic.example';
+    process.env.GBRAIN_ANTHROPIC_MODEL = 'gbrain-anthropic-model';
+
+    expect(getSubagentConfig()).toEqual({
+      apiKey: 'gbrain-anthropic-key',
+      baseURL: 'https://gbrain-anthropic.example',
+      model: 'gbrain-anthropic-model',
+    });
+  });
+
+  test('subagent falls back to ANTHROPIC_* for apiKey/baseURL and keeps default model', () => {
+    process.env.ANTHROPIC_API_KEY = 'anthropic-key';
+    process.env.ANTHROPIC_BASE_URL = 'https://anthropic.example';
+
+    expect(getSubagentConfig()).toEqual({
+      apiKey: 'anthropic-key',
+      baseURL: 'https://anthropic.example',
+      model: 'claude-sonnet-4-6',
     });
   });
 
