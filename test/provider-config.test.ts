@@ -115,6 +115,19 @@ describe('provider-config', () => {
     });
   });
 
+  test('provider-config trims non-empty env values before returning them', () => {
+    process.env.GBRAIN_EMBED_API_KEY = '  embed-key  ';
+    process.env.GBRAIN_EMBED_BASE_URL = '  https://embed.example/v1  ';
+    process.env.GBRAIN_EMBED_MODEL = '  embed-model  ';
+
+    expect(getEmbeddingConfig()).toEqual({
+      apiKey: 'embed-key',
+      baseURL: 'https://embed.example/v1',
+      model: 'embed-model',
+      dimensions: 1536,
+    });
+  });
+
   test('embedding preserves current defaults when unset', () => {
     expect(getEmbeddingConfig()).toEqual({
       apiKey: undefined,
