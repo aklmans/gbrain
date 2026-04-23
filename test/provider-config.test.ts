@@ -236,4 +236,17 @@ describe('provider-config', () => {
       model: 'whisper-compatible',
     });
   });
+
+  test('transcription ignores provider-specific envs when GBRAIN_TRANSCRIPTION_* vars are absent', () => {
+    process.env.GROQ_API_KEY = 'groq-key';
+    process.env.OPENAI_API_KEY = 'openai-key';
+    process.env.DEEPGRAM_API_KEY = 'deepgram-key';
+
+    expect(getTranscriptionConfig()).toEqual({
+      provider: undefined,
+      apiKey: undefined,
+      baseURL: undefined,
+      model: undefined,
+    });
+  });
 });

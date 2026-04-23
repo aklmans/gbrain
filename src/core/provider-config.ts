@@ -19,7 +19,12 @@ export interface TranscriptionProviderConfig {
 }
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
-  return values.find(value => typeof value === 'string' && value.trim().length > 0);
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    const normalized = value.trim();
+    if (normalized.length > 0) return normalized;
+  }
+  return undefined;
 }
 
 function parseIntOr(raw: string | undefined, fallback: number): number {
