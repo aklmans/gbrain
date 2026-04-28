@@ -1653,3 +1653,656 @@ describe('MinionQueue: Attachments', () => {
     expect(list[0].filename).toBe('b.txt');
   });
 });
+
+// --- v0.19.1 — queue-resilience (wall-clock sweep, maxWaiting race, concurrency clamp) ---
+
+describe('MinionQueue: v0.19.1 handleWallClockTimeouts (Layer 3 kill shot)', () => {
+  test('evicts active job past 2× timeout_ms — sets dead + wall-clock error_text', async () => {
+    const job = await queue.add('noop', {}, { timeout_ms: 100 });
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+         SET status='active',
+             lock_token='wc-test',
+             lock_until=now() - interval '1 second',
+             started_at=now() - interval '1 second',
+             timeout_at=now() - interval '0.9 second',
+             attempts_started = attempts_started + 1
+       WHERE id=$1`,
+      [job.id],
+    );
+    const killed = await queue.handleWallClockTimeouts(30_000);
+    expect(killed.length).toBe(1);
+    expect(killed[0].id).toBe(job.id);
+    const after = await queue.getJob(job.id);
+    expect(after?.status).toBe('dead');
+    expect(after?.error_text).toBe('wall-clock timeout exceeded');
+  });
+
+  test('timeout_ms NULL fallback uses 2 × lockDuration × max_stalled threshold', async () => {
+    const job = await queue.add('noop', {}, { max_stalled: 3 });
+    // Force timeout_ms / timeout_at NULL on-disk (columns might or might not be set by add).
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+         SET status='active',
+             timeout_ms=NULL,
+             timeout_at=NULL,
+             lock_token='wc-null',
+             lock_until=now() - interval '1 second',
+             started_at=now() - interval '61 seconds',
+             attempts_started = attempts_started + 1
+       WHERE id=$1`,
+      [job.id],
+    );
+    // 2 × lockDurationMs × max_stalled = 2 × 10_000 × 3 = 60_000 ms. started_at is 61s ago.
+    const killed = await queue.handleWallClockTimeouts(10_000);
+    expect(killed.length).toBe(1);
+    expect(killed[0].id).toBe(job.id);
+    const after = await queue.getJob(job.id);
+    expect(after?.status).toBe('dead');
+  });
+
+  test('respects threshold — active job within window is NOT killed', async () => {
+    const job = await queue.add('noop', {}, { timeout_ms: 100_000 });
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+         SET status='active',
+             lock_token='wc-inside',
+             lock_until=now() + interval '30 seconds',
+             started_at=now() - interval '10 seconds',
+             timeout_at=now() + interval '90 seconds',
+             attempts_started = attempts_started + 1
+       WHERE id=$1`,
+      [job.id],
+    );
+    const killed = await queue.handleWallClockTimeouts(30_000);
+    expect(killed.length).toBe(0);
+    const after = await queue.getJob(job.id);
+    expect(after?.status).toBe('active');
+  });
+});
+
+describe('MinionQueue: v0.19.1 maxWaiting — cap correctness + race (D2/H2)', () => {
+  test('coalesces 3rd submission when cap is 2 — returns existing most-recent waiting row', async () => {
+    const a = await queue.add('poll', {}, { maxWaiting: 2 });
+    const b = await queue.add('poll', {}, { maxWaiting: 2 });
+    const c = await queue.add('poll', {}, { maxWaiting: 2 });
+    expect(a.id).not.toBe(b.id);
+    expect(c.id).toBe(b.id); // coalesced to the most-recent waiting row
+    const rows = await engine.executeRaw<{ count: string }>(
+      `SELECT count(*)::text AS count FROM minion_jobs WHERE name='poll' AND status='waiting'`,
+    );
+    expect(parseInt(rows[0].count, 10)).toBe(2);
+  });
+
+  test('clamps maxWaiting: 0 → 1 (strictest cap)', async () => {
+    const a = await queue.add('squeeze', {}, { maxWaiting: 0 });
+    const b = await queue.add('squeeze', {}, { maxWaiting: 0 });
+    expect(b.id).toBe(a.id); // 0 clamped to 1, 2nd coalesces into 1st
+  });
+
+  test('floors maxWaiting: 1.7 → 1', async () => {
+    const a = await queue.add('floor', {}, { maxWaiting: 1.7 });
+    const b = await queue.add('floor', {}, { maxWaiting: 1.7 });
+    expect(b.id).toBe(a.id);
+  });
+
+  test('concurrent submitters respect the cap under Promise.all race (H2)', async () => {
+    // Serialized by pg_advisory_xact_lock keyed on (name, queue). Without it,
+    // two concurrent submits both see count<max and both insert — the TOCTOU
+    // bug codex caught in D2/H2.
+    const results = await Promise.all([
+      queue.add('race', {}, { maxWaiting: 2 }),
+      queue.add('race', {}, { maxWaiting: 2 }),
+      queue.add('race', {}, { maxWaiting: 2 }),
+    ]);
+    expect(results.length).toBe(3);
+    const rows = await engine.executeRaw<{ count: string }>(
+      `SELECT count(*)::text AS count FROM minion_jobs WHERE name='race' AND status='waiting'`,
+    );
+    expect(parseInt(rows[0].count, 10)).toBe(2); // cap held under concurrency
+  });
+
+  test('cross-queue isolation — same name in queue A does NOT suppress queue B (H2 secondary)', async () => {
+    const a = await queue.add('isolate', {}, { maxWaiting: 1, queue: 'default' });
+    // cap hit on queue=default with maxWaiting=1; 2nd would coalesce into `a`
+    const a2 = await queue.add('isolate', {}, { maxWaiting: 1, queue: 'default' });
+    expect(a2.id).toBe(a.id);
+    // Different queue — MUST insert a fresh row, NOT coalesce into queue=default
+    const b = await queue.add('isolate', {}, { maxWaiting: 1, queue: 'shell' });
+    expect(b.id).not.toBe(a.id);
+    expect(b.queue).toBe('shell');
+  });
+
+  test('unset maxWaiting — normal submit path, no coalesce, no cap', async () => {
+    const a = await queue.add('uncapped', {});
+    const b = await queue.add('uncapped', {});
+    const c = await queue.add('uncapped', {});
+    expect(new Set([a.id, b.id, c.id]).size).toBe(3);
+  });
+});
+
+describe('resolveWorkerConcurrency (v0.19.1 H3): clamp + validation', () => {
+  // jobs.ts handler — tested via direct import. Warning goes to stderr;
+  // tests verify return value only, not the warning line.
+  let resolveWorkerConcurrency: (args: string[], env?: NodeJS.ProcessEnv) => number;
+  let parseMaxWaitingFlag: (args: string[]) => number | undefined;
+  beforeAll(async () => {
+    const mod = await import('../src/commands/jobs.ts');
+    resolveWorkerConcurrency = mod.resolveWorkerConcurrency;
+    parseMaxWaitingFlag = mod.parseMaxWaitingFlag;
+  });
+
+  test('flag=4 env-unset → 4', () => {
+    expect(resolveWorkerConcurrency(['--concurrency', '4'], {} as NodeJS.ProcessEnv)).toBe(4);
+  });
+  test('flag-unset env=8 → 8', () => {
+    expect(resolveWorkerConcurrency([], { GBRAIN_WORKER_CONCURRENCY: '8' } as NodeJS.ProcessEnv)).toBe(8);
+  });
+  test('flag=2 env=8 → 2 (flag wins)', () => {
+    expect(resolveWorkerConcurrency(['--concurrency', '2'], { GBRAIN_WORKER_CONCURRENCY: '8' } as NodeJS.ProcessEnv)).toBe(2);
+  });
+  test('both unset → 1', () => {
+    expect(resolveWorkerConcurrency([], {} as NodeJS.ProcessEnv)).toBe(1);
+  });
+  test('garbage env "foo" → clamped to 1 (H3)', () => {
+    expect(resolveWorkerConcurrency([], { GBRAIN_WORKER_CONCURRENCY: 'foo' } as NodeJS.ProcessEnv)).toBe(1);
+  });
+  test('env=0 → clamped to 1 (H3 — prevents silent wedge)', () => {
+    expect(resolveWorkerConcurrency([], { GBRAIN_WORKER_CONCURRENCY: '0' } as NodeJS.ProcessEnv)).toBe(1);
+  });
+  test('env=-5 → clamped to 1 (H3)', () => {
+    expect(resolveWorkerConcurrency([], { GBRAIN_WORKER_CONCURRENCY: '-5' } as NodeJS.ProcessEnv)).toBe(1);
+  });
+});
+
+describe('parseMaxWaitingFlag (v0.19.1 H5): CLI flag wiring', () => {
+  let parseMaxWaitingFlag: (args: string[]) => number | undefined;
+  beforeAll(async () => {
+    parseMaxWaitingFlag = (await import('../src/commands/jobs.ts')).parseMaxWaitingFlag;
+  });
+
+  test('absent → undefined (no cap, default submit path)', () => {
+    expect(parseMaxWaitingFlag(['foo', '--params', '{}'])).toBeUndefined();
+  });
+  test('--max-waiting 2 → 2 (happy path)', () => {
+    expect(parseMaxWaitingFlag(['foo', '--max-waiting', '2'])).toBe(2);
+  });
+  test('--max-waiting 200 → clamped to 100', () => {
+    expect(parseMaxWaitingFlag(['foo', '--max-waiting', '200'])).toBe(100);
+  });
+  test('--max-waiting 0 → throws', () => {
+    expect(() => parseMaxWaitingFlag(['foo', '--max-waiting', '0'])).toThrow('positive integer');
+  });
+  test('--max-waiting abc → throws', () => {
+    expect(() => parseMaxWaitingFlag(['foo', '--max-waiting', 'abc'])).toThrow('positive integer');
+  });
+});
+
+describe('backpressure-audit (v0.19.1 Q1): JSONL on coalesce', () => {
+  test('logBackpressureCoalesce writes one JSONL line per coalesce', async () => {
+    const { logBackpressureCoalesce, resolveAuditDir, computeAuditFilename } =
+      await import('../src/core/minions/backpressure-audit.ts');
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const os = await import('node:os');
+
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-audit-'));
+    const prev = process.env.GBRAIN_AUDIT_DIR;
+    process.env.GBRAIN_AUDIT_DIR = tmp;
+    try {
+      expect(resolveAuditDir()).toBe(tmp);
+      logBackpressureCoalesce({
+        queue: 'default',
+        name: 'poll',
+        waiting_count: 2,
+        max_waiting: 2,
+        returned_job_id: 42,
+      });
+      const file = path.join(tmp, computeAuditFilename());
+      const text = fs.readFileSync(file, 'utf8');
+      const line = JSON.parse(text.trim());
+      expect(line.decision).toBe('coalesced');
+      expect(line.name).toBe('poll');
+      expect(line.returned_job_id).toBe(42);
+      expect(typeof line.ts).toBe('string');
+    } finally {
+      if (prev === undefined) delete process.env.GBRAIN_AUDIT_DIR;
+      else process.env.GBRAIN_AUDIT_DIR = prev;
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('MinionQueue: v0.19.1 wall-clock + handleTimeouts non-interference (T1)', () => {
+  test('wall-clock sweep does NOT evict a job that handleTimeouts would handle', async () => {
+    // Retry-able timeout: timeout_at < now() AND lock_until > now() — handleTimeouts
+    // is the correct killer here. wall-clock's 2× threshold has not fired yet.
+    const job = await queue.add('noop', {}, { timeout_ms: 100_000 });
+    await engine.executeRaw(
+      `UPDATE minion_jobs
+         SET status='active',
+             lock_token='t1',
+             lock_until=now() + interval '30 seconds',
+             started_at=now() - interval '2 seconds',
+             timeout_at=now() - interval '0.5 seconds',
+             attempts_started = attempts_started + 1
+       WHERE id=$1`,
+      [job.id],
+    );
+    // At this point: started_at is 2s ago, 2×timeout_ms = 200s. Wall-clock should NOT fire.
+    const killed = await queue.handleWallClockTimeouts(30_000);
+    expect(killed.length).toBe(0);
+    const after = await queue.getJob(job.id);
+    expect(after?.status).toBe('active');
+  });
+});
+
+// --- v0.22.2: RSS watchdog (--max-rss + periodic timer + gracefulShutdown) ---
+
+describe('MinionWorker: --max-rss watchdog', () => {
+  // Helper: build a worker with deterministic RSS injection. Tests pass a
+  // sequence of bytes; getRss() returns elements in order, repeating the last.
+  function makeRssSequence(values: number[]): () => number {
+    let i = 0;
+    return () => {
+      const v = values[Math.min(i, values.length - 1)];
+      i++;
+      return v;
+    };
+  }
+
+  test('per-job check: handler bumps RSS, post-job check trips, sibling aborts', async () => {
+    // 100MB threshold. RSS reads always return 250MB → first post-job check
+    // (after the 'quick' handler completes) trips and the 'slow' sibling
+    // sees its abort signal flip.
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 2,
+      maxRssMb: 100,
+      getRss: () => 250 * 1024 * 1024,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 60_000, // disable periodic — exercise per-job only
+    });
+
+    let sibling2Aborted = false;
+    let sibling2Resolved = false;
+    let sibling1Done = false;
+
+    worker.register('quick', async () => {
+      // Resolves immediately. Triggers post-job check.
+      sibling1Done = true;
+    });
+    worker.register('slow', async (job) => {
+      // Long-running sibling. Watch for abort signal.
+      job.signal.addEventListener('abort', () => { sibling2Aborted = true; });
+      await new Promise<void>((resolve) => {
+        const t = setInterval(() => {
+          if (job.signal.aborted) { clearInterval(t); sibling2Resolved = true; resolve(); }
+        }, 20);
+      });
+    });
+
+    await queue.add('slow', {});
+    await queue.add('quick', {});
+
+    await worker.start(); // returns when stop() flips and drain completes
+
+    expect(sibling1Done).toBe(true);
+    expect(sibling2Aborted).toBe(true);
+    expect(sibling2Resolved).toBe(true);
+  }, 60_000);
+
+  test('periodic timer: zero job completions, watchdog still fires', async () => {
+    // Threshold 100MB. RSS = 250MB on every call. No job ever completes.
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 100,
+      getRss: () => 250 * 1024 * 1024,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 100, // fire fast in tests
+    });
+
+    let abortedDuringHandler = false;
+
+    worker.register('forever', async (job) => {
+      // Never returns naturally. Wait on abort.
+      await new Promise<void>((resolve) => {
+        const t = setInterval(() => {
+          if (job.signal.aborted) {
+            abortedDuringHandler = true;
+            clearInterval(t);
+            resolve();
+          }
+        }, 20);
+      });
+    });
+
+    await queue.add('forever', {});
+
+    await worker.start();
+
+    expect(abortedDuringHandler).toBe(true);
+  }, 60_000);
+
+  test('shutdownAbort fires (closes shell-handler zombie gap)', async () => {
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 100,
+      getRss: () => 250 * 1024 * 1024,
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 100,
+    });
+
+    let shutdownSignalFired = false;
+
+    worker.register('observer', async (job) => {
+      // Subscribes to shutdownSignal — same pattern as shell.ts
+      job.shutdownSignal.addEventListener('abort', () => { shutdownSignalFired = true; });
+      await new Promise<void>((resolve) => {
+        const t = setInterval(() => {
+          if (job.signal.aborted) { clearInterval(t); resolve(); }
+        }, 20);
+      });
+    });
+
+    await queue.add('observer', {});
+    await worker.start();
+
+    expect(shutdownSignalFired).toBe(true);
+  }, 60_000);
+
+  test('below threshold: no-op (no shutdown)', async () => {
+    let postJobCount = 0;
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 1024,
+      getRss: () => { postJobCount++; return 50 * 1024 * 1024; }, // always 50MB, way under
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 60_000,
+    });
+
+    worker.register('noop', async () => {});
+
+    await queue.add('noop', {});
+    await queue.add('noop', {});
+    await queue.add('noop', {});
+
+    // Run for a moment, then stop manually
+    const startPromise = worker.start();
+    await new Promise(r => setTimeout(r, 500));
+    worker.stop();
+    await startPromise;
+
+    // Watchdog never tripped → all 3 jobs completed
+    const completed = await queue.getJobs({ status: 'completed' });
+    expect(completed.length).toBe(3);
+    expect(postJobCount).toBeGreaterThanOrEqual(3); // checkMemoryLimit ran each time
+  }, 60_000);
+
+  test('maxRssMb=0 disables watchdog entirely', async () => {
+    const worker = new MinionWorker(engine, {
+      queue: 'default',
+      concurrency: 1,
+      maxRssMb: 0,
+      getRss: () => 999_999 * 1024 * 1024, // huge, but disabled
+      pollInterval: 50,
+      stalledInterval: 10_000,
+      rssCheckInterval: 100,
+    });
+
+    worker.register('noop', async () => {});
+    await queue.add('noop', {});
+
+    const startPromise = worker.start();
+    await new Promise(r => setTimeout(r, 500));
+    worker.stop();
+    await startPromise;
+
+    const completed = await queue.getJobs({ status: 'completed' });
+    expect(completed.length).toBe(1);
+  }, 60_000);
+});
+
+// --- v0.21: connectWithRetry + isRetryableDbConnectError ---
+
+describe('connectWithRetry / isRetryableDbConnectError', () => {
+  test('isRetryableDbConnectError matches transient patterns', async () => {
+    const { isRetryableDbConnectError } = await import('../src/core/db.ts');
+    expect(isRetryableDbConnectError(new Error('password authentication failed for user postgres'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('connection refused'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('the database system is starting up'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('Connection terminated unexpectedly'))).toBe(true);
+    expect(isRetryableDbConnectError(new Error('something happened: ECONNRESET'))).toBe(true);
+  });
+
+  test('isRetryableDbConnectError rejects permanent errors', async () => {
+    const { isRetryableDbConnectError } = await import('../src/core/db.ts');
+    expect(isRetryableDbConnectError(new Error('extension "vector" does not exist'))).toBe(false);
+    expect(isRetryableDbConnectError(new Error('relation "pages" does not exist'))).toBe(false);
+    expect(isRetryableDbConnectError(new Error('syntax error at end of input'))).toBe(false);
+  });
+
+  test('connectWithRetry: 1st rejects transient, 2nd succeeds', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        if (attempts === 1) throw new Error('password authentication failed for user postgres');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { baseDelayMs: 1, log: () => {} });
+    expect(attempts).toBe(2);
+  });
+
+  test('connectWithRetry: 3 transient rejects → throws', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        throw new Error('connection refused');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await expect(
+      connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { baseDelayMs: 1, log: () => {} })
+    ).rejects.toThrow('connection refused');
+    expect(attempts).toBe(3);
+  });
+
+  test('connectWithRetry: permanent error does NOT retry', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        throw new Error('extension "vector" does not exist');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await expect(
+      connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { baseDelayMs: 1, log: () => {} })
+    ).rejects.toThrow('extension "vector"');
+    expect(attempts).toBe(1);
+  });
+
+  test('connectWithRetry: noRetry honored', async () => {
+    const { connectWithRetry } = await import('../src/core/db.ts');
+    let attempts = 0;
+    const fakeEngine = {
+      connect: async () => {
+        attempts++;
+        throw new Error('connection refused');
+      },
+    } as unknown as Parameters<typeof connectWithRetry>[0];
+
+    await expect(
+      connectWithRetry(fakeEngine, { database_url: 'postgres://x' }, { noRetry: true, log: () => {} })
+    ).rejects.toThrow();
+    expect(attempts).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Abort signal propagation + force-eviction (v0.20.5 cycle-abort fix)
+// ---------------------------------------------------------------------------
+
+describe('MinionWorker: abort signal propagation (v0.20.5)', () => {
+  test('handler receiving abort signal can exit cleanly', async () => {
+    // Handler that respects AbortSignal
+    const job = await queue.add('abort-aware', {}, { timeout_ms: 150, max_attempts: 1 });
+    let signalAborted = false;
+
+    const worker = new MinionWorker(engine, { pollInterval: 50 });
+    worker.register('abort-aware', async (ctx) => {
+      // Simulate long work that checks signal
+      while (!ctx.signal.aborted) {
+        await new Promise(r => setTimeout(r, 10));
+      }
+      signalAborted = true;
+      throw ctx.signal.reason || new Error('aborted');
+    });
+
+    const workerPromise = worker.start();
+    // Wait for timeout (150ms) + handler to notice + margin
+    await new Promise(r => setTimeout(r, 500));
+    worker.stop();
+    await workerPromise;
+
+    expect(signalAborted).toBe(true);
+    const result = await queue.getJob(job.id);
+    // Should be dead (max_attempts: 1, aborted)
+    expect(result!.status).toBe('dead');
+    expect(result!.error_text).toContain('abort');
+  });
+
+  test('handler ignoring abort signal still gets abort fired', async () => {
+    // Handler that IGNORES AbortSignal — the exact bug pattern.
+    // We verify the abort fires (the signal flips) even though the handler
+    // doesn't check it. The 30s force-eviction grace is too long for unit
+    // tests; the E2E test in test/e2e/worker-abort-recovery.test.ts covers
+    // the full force-eviction path. Here we just verify the abort signal
+    // is delivered to the handler context.
+    const job = await queue.add('abort-ignorer', {}, { timeout_ms: 100, max_attempts: 1 });
+    let handlerStarted = false;
+    let signalWasAborted = false;
+
+    const worker = new MinionWorker(engine, { pollInterval: 50 });
+    worker.register('abort-ignorer', async (ctx) => {
+      handlerStarted = true;
+      // Wait a bit, then check if signal was aborted
+      await new Promise(r => setTimeout(r, 200));
+      signalWasAborted = ctx.signal.aborted;
+      // Now exit (a well-behaved handler would do this)
+      if (ctx.signal.aborted) {
+        throw ctx.signal.reason || new Error('aborted');
+      }
+      return { ok: true };
+    });
+
+    const workerPromise = worker.start();
+    await new Promise(r => setTimeout(r, 500));
+
+    expect(handlerStarted).toBe(true);
+    expect(signalWasAborted).toBe(true);
+
+    worker.stop();
+    await workerPromise;
+
+    const result = await queue.getJob(job.id);
+    expect(result!.status).toBe('dead');
+  });
+
+  test('worker claims new jobs after timeout eviction (no wedge)', async () => {
+    // The critical regression test: submit a slow job that times out,
+    // then submit a fast job. The fast job MUST execute.
+    const slowJob = await queue.add('slow-timeout', {}, { timeout_ms: 100, max_attempts: 1 });
+    let slowAborted = false;
+    let fastExecuted = false;
+
+    const worker = new MinionWorker(engine, { pollInterval: 50, concurrency: 1 });
+    worker.register('slow-timeout', async (ctx) => {
+      // Respects abort but takes a moment
+      await new Promise(r => setTimeout(r, 50));
+      while (!ctx.signal.aborted) {
+        await new Promise(r => setTimeout(r, 10));
+      }
+      slowAborted = true;
+      throw new Error('aborted: timeout');
+    });
+    worker.register('fast-after', async () => {
+      fastExecuted = true;
+      return { fast: true };
+    });
+
+    const workerPromise = worker.start();
+
+    // Wait for slow job to start and timeout
+    await new Promise(r => setTimeout(r, 300));
+
+    // Now submit the fast job — it should get claimed
+    const fastJob = await queue.add('fast-after', {});
+    await new Promise(r => setTimeout(r, 300));
+
+    worker.stop();
+    await workerPromise;
+
+    expect(slowAborted).toBe(true);
+    expect(fastExecuted).toBe(true);
+
+    const slowResult = await queue.getJob(slowJob.id);
+    expect(slowResult!.status).toBe('dead');
+
+    const fastResult = await queue.getJob(fastJob.id);
+    expect(fastResult!.status).toBe('completed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkAborted (v0.20.5 cycle.ts)
+// ---------------------------------------------------------------------------
+
+describe('checkAborted (v0.20.5 cycle signal)', () => {
+  // Import the function indirectly by testing the behavior pattern
+  test('undefined signal does not throw', () => {
+    // checkAborted is not exported, so we test through CycleOpts behavior.
+    // This test validates the pattern directly. The `as` cast keeps the
+    // union type intact — a bare `const signal = undefined` (or even
+    // `const signal: AbortSignal | undefined = undefined`) would narrow
+    // back to literal `undefined` via TS control-flow analysis and then
+    // reject the optional-chain access on it.
+    const signal = undefined as AbortSignal | undefined;
+    expect(() => {
+      if (signal?.aborted) throw new Error('aborted');
+    }).not.toThrow();
+  });
+
+  test('non-aborted signal does not throw', () => {
+    const abort = new AbortController();
+    expect(() => {
+      if (abort.signal.aborted) throw new Error('aborted');
+    }).not.toThrow();
+  });
+
+  test('aborted signal throws with reason', () => {
+    const abort = new AbortController();
+    abort.abort(new Error('timeout'));
+    expect(() => {
+      if (abort.signal.aborted) {
+        const reason = abort.signal.reason instanceof Error
+          ? abort.signal.reason.message
+          : String(abort.signal.reason || 'aborted');
+        throw new Error(`[cycle] aborted between phases: ${reason}`);
+      }
+    }).toThrow('aborted between phases: timeout');
+  });
+});

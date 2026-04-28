@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { Operation, OperationContext } from '../src/core/operations.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import type { SearchResult } from '../src/core/types.ts';
 
 const ENV_KEYS = [
@@ -10,37 +14,17 @@ const ENV_KEYS = [
 
 let envSnapshot = new Map<string, string | undefined>();
 const embedCalls: string[] = [];
-const importCalls: Array<{ slug: string; content: string; noEmbed: boolean }> = [];
+const embedBatchCalls: string[][] = [];
 
 mock.module('../src/core/embedding.ts', () => ({
   embed: async (text: string) => {
     embedCalls.push(text);
     return new Float32Array([0.25]);
   },
-}));
-
-mock.module('../src/core/import-file.ts', () => ({
-  importFromContent: async (
-    _engine: BrainEngine,
-    slug: string,
-    content: string,
-    opts: { noEmbed?: boolean } = {},
-  ) => {
-    importCalls.push({
-      slug,
-      content,
-      noEmbed: opts.noEmbed === true,
-    });
-    return {
-      slug,
-      status: 'imported',
-      chunks: 1,
-    };
+  embedBatch: async (texts: string[]) => {
+    embedBatchCalls.push([...texts]);
+    return texts.map(() => new Float32Array(1536).fill(0.25));
   },
-}));
-
-mock.module('../src/core/output/post-write.ts', () => ({
-  runPostWriteLint: async () => ({ ran: false, skippedReason: 'disabled' }),
 }));
 
 const hybridModulePromise = import('../src/core/search/hybrid.ts');
@@ -69,7 +53,7 @@ beforeEach(() => {
     delete process.env[key];
   }
   embedCalls.length = 0;
-  importCalls.length = 0;
+  embedBatchCalls.length = 0;
 });
 
 afterEach(() => {
@@ -79,6 +63,19 @@ afterEach(() => {
     else process.env[key] = value;
   }
 });
+
+async function withPGLiteEngine<T>(fn: (engine: PGLiteEngine) => Promise<T>): Promise<T> {
+  const dbDir = mkdtempSync(join(tmpdir(), 'gbrain-provider-gate-'));
+  const engine = new PGLiteEngine();
+  try {
+    await engine.connect({ engine: 'pglite', database_path: dbDir });
+    await engine.initSchema();
+    return await fn(engine);
+  } finally {
+    await engine.disconnect();
+    rmSync(dbDir, { recursive: true, force: true });
+  }
+}
 
 describe('provider gate regression coverage', () => {
   test('hybridSearch honors GBRAIN_EMBED_API_KEY when OPENAI_API_KEY is unset', async () => {
@@ -110,50 +107,44 @@ describe('provider gate regression coverage', () => {
 
     const { operations } = await operationsModulePromise;
     const putPage = operations.find(o => o.name === 'put_page') as Operation;
-    const ctx: OperationContext = {
-      engine: {} as BrainEngine,
-      config: { engine: 'postgres' } as any,
-      logger: { info: () => {}, warn: () => {}, error: () => {} },
-      dryRun: false,
-      remote: true,
-    };
 
-    const result = await putPage.handler(ctx, { slug: 'notes/provider-gate', content: 'stub content' });
+    await withPGLiteEngine(async (engine) => {
+      const ctx: OperationContext = {
+        engine,
+        config: { engine: 'pglite' } as any,
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+        dryRun: false,
+        remote: true,
+      };
 
-    expect(importCalls).toEqual([
-      {
+      const result = await putPage.handler(ctx, { slug: 'notes/provider-gate', content: 'stub content' });
+
+      expect(embedBatchCalls).toEqual([['stub content']]);
+      expect(result).toMatchObject({
         slug: 'notes/provider-gate',
-        content: 'stub content',
-        noEmbed: false,
-      },
-    ]);
-    expect(result).toMatchObject({
-      slug: 'notes/provider-gate',
-      status: 'created_or_updated',
-      auto_links: { skipped: 'remote' },
-      auto_timeline: { skipped: 'remote' },
+        status: 'created_or_updated',
+        auto_links: { skipped: 'remote' },
+        auto_timeline: { skipped: 'remote' },
+      });
     });
   });
 
   test('put_page still disables embedding when no provider key is configured', async () => {
     const { operations } = await operationsModulePromise;
     const putPage = operations.find(o => o.name === 'put_page') as Operation;
-    const ctx: OperationContext = {
-      engine: {} as BrainEngine,
-      config: { engine: 'postgres' } as any,
-      logger: { info: () => {}, warn: () => {}, error: () => {} },
-      dryRun: false,
-      remote: true,
-    };
 
-    await putPage.handler(ctx, { slug: 'notes/no-provider-key', content: 'stub content' });
+    await withPGLiteEngine(async (engine) => {
+      const ctx: OperationContext = {
+        engine,
+        config: { engine: 'pglite' } as any,
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+        dryRun: false,
+        remote: true,
+      };
 
-    expect(importCalls).toEqual([
-      {
-        slug: 'notes/no-provider-key',
-        content: 'stub content',
-        noEmbed: true,
-      },
-    ]);
+      await putPage.handler(ctx, { slug: 'notes/no-provider-key', content: 'stub content' });
+
+      expect(embedBatchCalls).toEqual([]);
+    });
   });
 });

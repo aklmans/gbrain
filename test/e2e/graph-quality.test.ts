@@ -11,27 +11,39 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { runExtract } from '../../src/commands/extract.ts';
 import { operationsByName } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
 
 let engine: PGLiteEngine;
+let dbDir: string;
 
 beforeAll(async () => {
+  dbDir = mkdtempSync(join(tmpdir(), 'gbrain-graph-quality-'));
   engine = new PGLiteEngine();
-  await engine.connect({});
+  await engine.connect({ engine: 'pglite', database_path: dbDir });
   await engine.initSchema();
 }, 60_000);
 
 afterAll(async () => {
   await engine.disconnect();
+  rmSync(dbDir, { recursive: true, force: true });
 });
 
 async function truncateAll() {
   for (const t of ['content_chunks', 'links', 'tags', 'raw_data', 'timeline_entries', 'page_versions', 'ingest_log', 'pages']) {
     await (engine as any).db.exec(`DELETE FROM ${t}`);
   }
+}
+
+async function resetTestState() {
+  await truncateAll();
+  await engine.setConfig('auto_link', 'true');
+  await engine.setConfig('auto_timeline', 'true');
 }
 
 function makeContext(): OperationContext {
@@ -44,7 +56,7 @@ function makeContext(): OperationContext {
 }
 
 describe('E2E graph quality (v0.10.1 pipeline)', () => {
-  beforeEach(truncateAll, 15_000);
+  beforeEach(resetTestState, 15_000);
 
   test('full pipeline: seed -> extract links -> extract timeline -> verify', async () => {
     // Seed 5 pages with entity refs and timeline content.
