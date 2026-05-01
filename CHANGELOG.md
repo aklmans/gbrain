@@ -2,6 +2,102 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.24.0] - 2026-04-26
+
+## **The skillify loop stops lying. Privacy guard runs, `--llm` is honest, ghost rows go away.**
+## **Plus: Tier 2 LLM-skill tests now block every PR, not just the nightly cron.**
+
+v0.19.0 shipped four new CLI commands (`skillify`, `skillpack`, `routing-eval`, `skillify-check`) and got rave coverage. v0.24.0 is the production-hardening pass on top of that: every public contract that lied about itself, every silent footgun, every CI guard that wasn't wired up. No new features. No new commands. Just the unsexy fixes that turn a feature release into a production release.
+
+The biggest save: the skillpack installer would have silently deleted your skills. The original v0.19 design's "rebuild managed block" path was load-bearing wrong — a user installing `alpha` then later running `gbrain skillpack install beta` alone would have lost `alpha`. Codex caught it during cross-model review. The fix preserves cumulative-install semantics via a receipt comment in the fence: `<!-- gbrain:skillpack:manifest cumulative-slugs="alpha,beta,..." -->`. Old fences upgrade silently. User-added rows survive with a stderr warning telling the operating agent to investigate. `install --all` is now the only path that prunes; per-skill install never destroys what it didn't install.
+
+The biggest unsexy fix: `gbrain routing-eval --llm` was a documented feature that did nothing. README, CHANGELOG, and CLI help all said it ran an LLM tie-break layer. The code returned structural-only results with no warning, no error, no signal at all. v0.24.0 makes the flag honest across all four touchpoints. Until the LLM layer ships, `--llm` emits a stderr placeholder notice and runs structural. CI logs see it. Docs match the code. The release notes don't lie.
+
+The CI fix nobody asked for: `scripts/check-privacy.sh` exists in the repo to enforce the OpenClaw fork-name ban from `CLAUDE.md:550`. It was never wired into anything. v0.24.0 prepends it to `package.json`'s `"test"` chain alongside the other `check-*.sh` guards. A regression test asserts the wiring stays. The first run caught 5 banned-name references that had been sitting in master's `CHANGELOG.md`, `src/cli.ts`, `src/commands/sync.ts`, and `skills/migrations/v0.19.0.md` for releases — fixed in the same wave.
+
+### The numbers that matter
+
+Counted against this branch's review trail and the local test suite:
+
+| Metric | BEFORE v0.24.0 | AFTER v0.24.0 | Δ |
+|---|---|---|---|
+| `routing-eval --llm` behavior matches docs | no | yes | fixed |
+| Public-contract drift surfaces fixed | 4 (README, CHANGELOG, CLI help, runtime) | 0 | −4 |
+| `gbrain skillpack install <name>` preserves prior installs | yes (was a happy accident) | yes (with receipt + regression test) | locked |
+| Regression test guarding cumulative-install semantics | none | `test 8a` ("install alpha; then install beta; assert both") | +1 |
+| Banned-name leaks in tracked files | 5 (master state) | 0 | −5 |
+| `check-privacy.sh` runs in CI | never | every PR (via `bun run test`) | wired |
+| Tier 2 LLM-skill E2E gates each PR | no (nightly cron only) | yes | wired |
+| Stale `v0.17/v0.18` version labels in new code | 7 sites across 5 files | 0 | −7 |
+| Skillify scaffold idempotency under hand-edited resolver | backtick-only detection | backtick + quoted + bare | fixed |
+
+Cross-model review trail: **CEO + Eng + Codex outside voice**. 14 user decisions captured, 0 unresolved, 1 critical Codex catch (the cumulative-install regression that would have shipped). Two-model review caught a one-model-blind spot. The receipt design is in `src/core/skillpack/installer.ts:applyManagedBlock`.
+
+### What this means for builders
+
+Nothing breaks. `gbrain upgrade` is the path. Existing brains: no schema migration. Existing AGENTS.md fences without a receipt comment auto-upgrade silently on the next `gbrain skillpack install` (one-time clean rebuild, no warnings). User-added skill rows inside the fence now survive reinstalls with a clear stderr breadcrumb: `[skillpack] unknown row in managed block: "<slug>" — Investigate: user-added skill, hand-edited fence, or typo?`
+
+If you ship custom CI: `bun run test` now gates `check-privacy.sh` alongside the existing `check-jsonb-pattern.sh`, `check-progress-to-stdout.sh`, and `check-wasm-embedded.sh`. If you grepped through gbrain's source in your own CI, no surface change. If you previously ran `gbrain routing-eval --llm` expecting an LLM pass, you'll now see a stderr line telling you what's actually happening and your scripts keep working — exit code is still 0/1 based on structural results. Tier 2 (`test/e2e/skills.test.ts`) now runs on every PR using existing repo secrets. Adds ~3-5 min per PR for real protection against LLM-adjacent regressions.
+
+## To take advantage of v0.24.0
+
+`gbrain upgrade` does this automatically. To verify:
+
+1. **Binary version:**
+   ```bash
+   gbrain --version   # should say 0.24.0
+   ```
+2. **`--llm` honesty:**
+   ```bash
+   gbrain routing-eval --llm 2>&1 | grep -i placeholder
+   # expect: "[routing-eval] --llm flag is a placeholder in this release..."
+   ```
+3. **Skillpack receipt + cumulative semantics:**
+   ```bash
+   gbrain skillpack install <name>
+   grep "gbrain:skillpack:manifest cumulative-slugs" $OPENCLAW_WORKSPACE/AGENTS.md
+   # expect a receipt line listing every gbrain-installed slug
+   ```
+4. **Privacy guard wired:**
+   ```bash
+   grep "check-privacy.sh" package.json
+   # expect a hit in scripts.test
+   ```
+5. **If anything fails,** file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor` and which step broke.
+
+No schema migration. Existing brains work unchanged.
+
+### Itemized changes
+
+#### Fixed
+
+- **`gbrain routing-eval --llm`** is no longer a silent no-op. CLI emits a stderr placeholder notice; `--json` mode preserves clean stdout JSON with the warning on stderr only (no bleed). README:294, CHANGELOG entry, and CLI help text all rewritten to match the actual behavior. Tests in `test/routing-eval-cli.test.ts`.
+- **Skillpack installer** now embeds a receipt comment (`<!-- gbrain:skillpack:manifest cumulative-slugs="..." version="..." -->`) inside the managed-block fence on every install. Per-skill installs accumulate via union(prior receipt, this-call slugs); `install --all` prunes slugs no longer in the bundle (the only prune path). Unknown rows inside the fence (user hand-adds, third-party bundles, typos) survive reinstalls with a stderr `Investigate:` breadcrumb. Pre-v0.24.0 fences upgrade silently on first install. Tests in `test/skillpack-install.test.ts` cover all four paths including the regression-guard "install alpha; install beta; assert both present."
+- **`gbrain skillify scaffold --force`** no longer creates duplicate resolver rows when the existing row uses non-backticked path forms. The detection regex now matches backticked, single-quoted, double-quoted, and bare forms, with anchored boundaries to prevent false-matching shared-prefix slugs (e.g., `demo` vs `demo-extended`). Tests in `test/skillify-scaffold.test.ts`.
+- **5 banned OpenClaw fork-name leaks** scrubbed from public artifacts (`CHANGELOG.md`, `skills/migrations/v0.19.0.md`, `src/cli.ts`, `src/commands/sync.ts`). All originated in earlier releases when the privacy script existed but wasn't wired to CI. Replacements per `CLAUDE.md:550` (origin-story → "Garry's OpenClaw"; reader-facing → "your OpenClaw").
+- **Stale `v0.17`/`v0.18` version labels** removed from 5 files (`src/core/routing-eval.ts`, `src/core/filing-audit.ts`, `src/commands/check-resolvable.ts`, `src/commands/skillify.ts`, `src/commands/skillpack.ts`). Replaced with version-agnostic phrasing or current-release references.
+
+#### Changed
+
+- **`package.json` `"test"` script** now prepends `scripts/check-privacy.sh` to the existing chain. Test failure if the banned fork name appears anywhere in tracked files.
+- **`.github/workflows/e2e.yml`** Tier 2 job (`test/e2e/skills.test.ts`, requires `OPENAI_API_KEY` + `ANTHROPIC_API_KEY`) promoted from schedule-only to required per-PR CI. Same secrets, same install path, same workflow YAML structure — just removed the `if: github.event_name == 'schedule' or workflow_dispatch` guard.
+
+#### Added (tests)
+
+- **`test/routing-eval-cli.test.ts`** (4 cases) — `--llm` placeholder behavior across human + JSON modes, exit-code preservation, regression guard for the silent-no-op state.
+- **`test/privacy-script-wired.test.ts`** (3 cases) — asserts `check-privacy.sh` exists and is executable, asserts `package.json` `scripts.test` references it, asserts the `check:privacy` convenience alias is present.
+- **`test/skillpack-install.test.ts`** (+4 cases) — cumulative-install regression guard, full-bundle prune semantics, unknown-row preserve+warn, pre-v0.24 upgrade path. Total 30 cases for the installer.
+- **`test/skillify-scaffold.test.ts`** (+4 cases) — bare/quoted/single-quoted resolver rows + shared-prefix slug isolation. Total 18 cases for scaffold.
+
+#### Deferred
+
+- LLM tie-break layer for `routing-eval --llm` — placeholder ships in v0.24.0, full implementation is a future release. Code already accepts the flag.
+- `gbrain skillpack forget <name>` — explicit uninstall command. v0.24.0 covers the minimum (managed-block prune via `install --all`). Tracked in `TODOS.md`.
+- PID-liveness check in installer lock — current behavior (mtime-based stale detection + `--force-unlock` opt-in) is conservative; PID liveness is a v0.24.x ergonomic. Tracked.
+
+### Cross-model review credit
+
+This release's quality is directly attributable to running `/plan-ceo-review` + `/plan-eng-review` + `/codex review` in sequence on the v0.19.0 production-readiness audit. Codex caught one critical and three high findings the in-skill review missed: cumulative-install regression (load-bearing), `--llm` public-contract drift (4-surface scrub), Tier 2 framing as unowned dependency, and 6.5 hours of guesswork named files in the flake-diagnosis plan. The cross-model agreement on every fix is the signal that turns "ship the demo path" into "ship the production path."
 ## [0.23.2] - 2026-04-30
 
 **The dream cycle now stamps every page it writes. The guard checks for the stamp. No content guessing, no false positives.**
@@ -764,7 +860,7 @@ If `gbrain sync` blocks with parse failures, the breakdown tells you what to fix
 - DB-layer error patterns (`DB_DUPLICATE_KEY`, `STATEMENT_TIMEOUT`) check BEFORE YAML patterns in the classifier, so Postgres errors don't get YAML-labeled.
 - Frontmatter regex patterns rewritten to match canonical messages from `collectValidationErrors()` (`File is empty...`, `No closing --- delimiter found`, `Frontmatter block is empty`) instead of aspirational code-token strings (`missing.*open`) that never appeared in practice.
 
-Closes #500.
+Closes #500. Eng-review plan: `~/.claude/plans/then-codex-synchronous-toucan.md` (codex outside-voice agreed on all 7 findings).
 
 ## [0.22.8] - 2026-04-28
 
@@ -913,6 +1009,8 @@ Then point Claude Desktop, claude.ai/code, or any MCP client at `http://your-tun
 6. **If `gbrain serve --http` exits with "Postgres engine required":** PGLite is local-only by design. Either keep using stdio (`gbrain serve`) for local agents, or migrate to Postgres (`gbrain migrate --to supabase`).
 
 If anything breaks: `gbrain doctor`, `~/.gbrain/upgrade-errors.jsonl` (if present), and please file an issue at https://github.com/garrytan/gbrain/issues with both.
+
+
 
 ## [0.22.6.1] - 2026-04-26
 
@@ -1359,7 +1457,7 @@ Two SearchOpts additions plumb hard-exclude through the API: `exclude_slug_prefi
 
 ### The numbers that matter
 
-A new BrainBench category — **Cat 13b: Source Swamp Resistance** — ships in the sibling [gbrain-evals](https://github.com/garrytan/gbrain-evals) repo. The corpus is 20 pages: 10 short opinionated `originals/` pages and 10 long `wintermute/chat/` dumps that mention the same multi-word phrases at higher per-byte density. 30 hand-curated queries assert the curated page wins.
+A new BrainBench category — **Cat 13b: Source Swamp Resistance** — ships in the sibling [gbrain-evals](https://github.com/garrytan/gbrain-evals) repo. The corpus is 20 pages: 10 short opinionated `originals/` pages and 10 long `openclaw/chat/` dumps that mention the same multi-word phrases at higher per-byte density. 30 hand-curated queries assert the curated page wins.
 
 | gbrain version                       | Top-1 hit | Top-3 hit | Swamp@top |
 |--------------------------------------|-----------|-----------|-----------|
@@ -1373,17 +1471,17 @@ The world-v1 corpus (BrainBench Cats 1+2 retrieval, 145 relational queries) is u
 
 ### What this means for you
 
-If your brain's biggest directories are chat dumps, daily logs, or X archives, search just got dramatically better for the topic queries you actually run. If you depend on chat surfacing for date-framed questions ("what did we discuss last week"), nothing changed ... the intent classifier routes those to `detail=high` which bypasses source-boost. If you want a different boost map, set `GBRAIN_SOURCE_BOOST=originals/:1.8,wintermute/chat/:0.3` and ship.
+If your brain's biggest directories are chat dumps, daily logs, or X archives, search just got dramatically better for the topic queries you actually run. If you depend on chat surfacing for date-framed questions ("what did we discuss last week"), nothing changed ... the intent classifier routes those to `detail=high` which bypasses source-boost. If you want a different boost map, set `GBRAIN_SOURCE_BOOST=originals/:1.8,openclaw/chat/:0.3` and ship.
 
 ## To take advantage of v0.22.0
 
 `gbrain upgrade` should do this automatically. No DB migration is needed ... the change is purely a SQL ranking refactor on existing tables.
 
-1. **No manual migration step required.** The new ranking is on by default. Defaults are tuned for a brain with the canonical `originals/`, `concepts/`, `writing/`, `meetings/`, `daily/`, `media/x/`, `wintermute/chat/` shape.
+1. **No manual migration step required.** The new ranking is on by default. Defaults are tuned for a brain with the canonical `originals/`, `concepts/`, `writing/`, `meetings/`, `daily/`, `media/x/`, `openclaw/chat/` shape.
 2. **Tune for your brain (optional):**
    ```bash
    # Stronger originals boost, harder chat dampening
-   export GBRAIN_SOURCE_BOOST="originals/:1.8,wintermute/chat/:0.3"
+   export GBRAIN_SOURCE_BOOST="originals/:1.8,openclaw/chat/:0.3"
    # Add a directory to the hard-exclude list
    export GBRAIN_SEARCH_EXCLUDE="scratch/,private/"
    ```
@@ -1404,7 +1502,7 @@ If your brain's biggest directories are chat dumps, daily logs, or X archives, s
 
 #### Source-aware retrieval
 
-- New module `src/core/search/source-boost.ts` ships the default boost map (`originals/` 1.5, `concepts/` 1.3, `writing/` 1.4, `people/companies/deals/` 1.2, `daily/` 0.8, `media/x/` 0.7, `wintermute/chat/` 0.5) and the four default hard-exclude prefixes (`test/`, `archive/`, `attachments/`, `.raw/`). Both knobs override via env (`GBRAIN_SOURCE_BOOST`, `GBRAIN_SEARCH_EXCLUDE`) or per-call SearchOpts.
+- New module `src/core/search/source-boost.ts` ships the default boost map (`originals/` 1.5, `concepts/` 1.3, `writing/` 1.4, `people/companies/deals/` 1.2, `daily/` 0.8, `media/x/` 0.7, `openclaw/chat/` 0.5) and the four default hard-exclude prefixes (`test/`, `archive/`, `attachments/`, `.raw/`). Both knobs override via env (`GBRAIN_SOURCE_BOOST`, `GBRAIN_SEARCH_EXCLUDE`) or per-call SearchOpts.
 - New module `src/core/search/sql-ranking.ts` is a pair of pure SQL-fragment builders shared between Postgres and PGLite engines. `buildSourceFactorCase` emits a longest-prefix-match CASE expression and returns literal `'1.0'` when `detail === 'high'` so temporal queries bypass source-boost. `buildHardExcludeClause` emits `NOT (col LIKE 'p1%' OR col LIKE 'p2%')` ... OR-chain wrapped in NOT, never `NOT LIKE ALL/ANY` (those don't express set-exclusion). LIKE meta-character escape covers `%`, `_`, AND `\` (backslash matters because it's Postgres LIKE's default escape char). Single-quote doubling renders SQL-injection-style inputs inert.
 - `src/core/postgres-engine.ts` and `src/core/pglite-engine.ts` ... three methods wired: `searchKeyword` (chunk-grain CTE → DISTINCT ON page dedup, multiplies ts_rank by source-factor), `searchKeywordChunks` (the chunk-grain anchor primitive used by Cathedral II two-pass retrieval, also gets source-boost so the anchor pool is dampened on chat dirs), and `searchVector` (becomes a two-stage CTE: pure-distance HNSW inner ORDER BY, source-boost re-rank in outer SELECT, innerLimit scales with offset to preserve pagination).
 - `src/core/types.ts` ... SearchOpts gains two fields: `exclude_slug_prefixes?: string[]` (additive over defaults + env) and `include_slug_prefixes?: string[]` (subtractive opt-back-in).
@@ -1585,7 +1683,7 @@ If you build with gbrain + OpenClaw + Claude Code: add your repo as a source (`g
 
 ### Itemized changes
 
-**Layer 0 — Wintermute's baseline (cherry-picked, author scrubbed).** Tree-sitter code chunker for 6 languages (TS/TSX/JS/Python/Ruby/Go), `gbrain repos add/list/remove`, strategy-aware sync, `PageType 'code'`, `importCodeFile`, per-file sync progress via the v0.15.2 reporter. Preserved exactly, committed under Garry's author identity.
+**Layer 0 — Garry's OpenClaw baseline (cherry-picked, author scrubbed).** Tree-sitter code chunker for 6 languages (TS/TSX/JS/Python/Ruby/Go), `gbrain repos add/list/remove`, strategy-aware sync, `PageType 'code'`, `importCodeFile`, per-file sync progress via the v0.15.2 reporter. Preserved exactly, committed under Garry's author identity.
 
 **Layer 1 — A6 structured errors + version bump.** New `src/core/errors.ts` exports `StructuredAgentError` + `buildError` + `serializeError`. Matches the v0.17.0 `CycleReport.PhaseResult.error` shape so agent-consumable errors stay consistent across every gbrain surface. `globToRegex` bug fix: `src/**/*.ts` now matches `src/foo.ts` (zero intermediate dirs). `GBRAIN_HOME` env var for test isolation. `package.json` → `0.19.0`.
 
@@ -1593,7 +1691,7 @@ If you build with gbrain + OpenClaw + Claude Code: add your repo as a source (`g
 
 **Layer 3 — schema migrations v25 + v26.** `pages.page_kind TEXT CHECK (page_kind IN ('markdown','code'))` on v25, using Postgres's `NOT VALID` + `VALIDATE CONSTRAINT` split so tables with millions of pages don't hold a write lock during the ALTER. `content_chunks` adds `language`, `symbol_name`, `symbol_type`, `start_line`, `end_line` on v26, plus partial indexes keyed on non-null values so code-chunk lookups stay cheap on mixed markdown+code brains.
 
-**Layer 4 — delete Wintermute's multi-repo, wire v0.18.0 sources.** The `repos` abstraction in Wintermute's baseline turned out to be redundant with v0.18.0's `sources` subsystem (per-source `last_commit`, `federated` search config, RLS-friendly, DB-native). v0.19.0 keeps `gbrain repos` as a deprecated alias that routes into `runSources`. `sync --all` iterates the `sources` table instead of a local config array. Codex's P0 #2 (per-repo sync bookmarks) and P0 #3 (slug collision) both resolved by the existing schema.
+**Layer 4 — delete the OpenClaw baseline's multi-repo, wire v0.18.0 sources.** The `repos` abstraction in Garry's OpenClaw baseline turned out to be redundant with v0.18.0's `sources` subsystem (per-source `last_commit`, `federated` search config, RLS-friendly, DB-native). v0.19.0 keeps `gbrain repos` as a deprecated alias that routes into `runSources`. `sync --all` iterates the `sources` table instead of a local config array. Codex's P0 #2 (per-repo sync bookmarks) and P0 #3 (slug collision) both resolved by the existing schema.
 
 **Layer 5 — Chonkie chunker parity (E2a).** 6 languages → 29. Embedded asset paths for every grammar in `tree-sitter-wasms`. Accurate tokenizer via `@dqbd/tiktoken` `cl100k_base` (lazy-init). Small-sibling merging with the Chonkie `bisect_left` pattern tuned to 15% of chunk target, so tiny siblings (imports, single-line consts) collapse while substantive classes/functions stay independent. `CHUNKER_VERSION=3` folded into `importCodeFile`'s `content_hash` so chunker-shape changes across releases force clean re-chunks without `sync --force`.
 
@@ -2040,7 +2138,7 @@ No schema migration. Existing brains work unchanged.
 - **`gbrain skillpack list`** — prints the curated bundle (25 skills) shipped with gbrain.
 - **`gbrain skillpack install <name>` / `--all`** — copies bundled skills into the target workspace. Automatically pulls shared convention files so nothing references a missing dep. Per-file diff protection, `--overwrite-local` escape hatch, `.gbrain-skillpack.lock` against concurrent installers, atomic managed-block update to AGENTS.md / RESOLVER.md.
 - **`gbrain skillpack diff <name>`** — per-file diff preview before install.
-- **`gbrain routing-eval`** — dedicated CI verb that runs routing fixtures (`skills/<name>/routing-eval.jsonl`) and surfaces intent-to-skill mismatches, ambiguous routing, and false positives. Default structural layer runs alongside `check-resolvable`; `--llm` opts into an LLM tie-break layer.
+- **`gbrain routing-eval`** — dedicated CI verb that runs routing fixtures (`skills/<name>/routing-eval.jsonl`) and surfaces intent-to-skill mismatches, ambiguous routing, and false positives. Ships the structural layer (same logic `check-resolvable` runs). The `--llm` flag is accepted as a placeholder for a future LLM tie-break layer; in this release it emits a stderr notice and runs structural only.
 - **`gbrain check-resolvable --strict`** — opt-in CI mode that promotes warnings to failures.
 - **`skills/_brain-filing-rules.json`** — machine-readable canonical filing rules (JSON sidecar to the prose `_brain-filing-rules.md`).
 - **`writes_pages: true` + `writes_to: [...]`** — new skill frontmatter fields consumed by the filing audit. Distinct from `mutating:` so cron schedulers and report writers aren't dragged into filing checks.

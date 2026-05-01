@@ -52,6 +52,10 @@ docs/                     Architecture docs
 ## Running tests
 
 ```bash
+# Recommended: full CI guard chain + tests (matches what CI runs)
+bun run test                      # privacy + jsonb + progress + wasm + typecheck + bun test
+
+# Just the test runner (skips CI guards)
 bun test                          # all tests (unit + E2E skipped without DB)
 bun test test/markdown.test.ts    # specific unit test
 
@@ -62,6 +66,13 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5434/gbrain_test bun run t
 # Or use your own Postgres / Supabase
 DATABASE_URL=postgresql://... bun run test:e2e
 ```
+
+Use `bun run test` before pushing. The guard chain catches: banned fork-name leaks
+(`scripts/check-privacy.sh`), `JSON.stringify(x)::jsonb` interpolation patterns
+(`scripts/check-jsonb-pattern.sh`), `\r` progress bleed to stdout
+(`scripts/check-progress-to-stdout.sh`), trailing-newline drift across tracked
+files (`scripts/check-trailing-newline.sh`), and silent fallback to recursive
+chunking in the compiled binary (`scripts/check-wasm-embedded.sh`).
 
 ### Local CI gate (recommended before pushing, v0.23.1+)
 
