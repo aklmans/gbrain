@@ -367,6 +367,51 @@ CREATE TABLE IF NOT EXISTS mcp_request_log (
 );
 
 -- ============================================================
+-- OAuth 2.1: clients, tokens, authorization codes
+-- ============================================================
+CREATE TABLE IF NOT EXISTS oauth_clients (
+  client_id               TEXT PRIMARY KEY,
+  client_secret_hash      TEXT,
+  client_name             TEXT NOT NULL,
+  redirect_uris           TEXT[],
+  grant_types             TEXT[] DEFAULT '{"client_credentials"}',
+  scope                   TEXT,
+  token_endpoint_auth_method TEXT,
+  client_id_issued_at     BIGINT,
+  client_secret_expires_at BIGINT,
+  created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+  token_hash   TEXT PRIMARY KEY,
+  token_type   TEXT NOT NULL,
+  client_id    TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+  scopes       TEXT[],
+  expires_at   BIGINT,
+  resource     TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_expiry ON oauth_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_client ON oauth_tokens(client_id);
+
+CREATE TABLE IF NOT EXISTS oauth_codes (
+  code_hash              TEXT PRIMARY KEY,
+  client_id              TEXT NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
+  scopes                 TEXT[],
+  code_challenge         TEXT NOT NULL,
+  code_challenge_method  TEXT NOT NULL DEFAULT 'S256',
+  redirect_uri           TEXT NOT NULL,
+  state                  TEXT,
+  resource               TEXT,
+  expires_at             BIGINT NOT NULL,
+  created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Composite index for admin dashboard request log queries
+CREATE INDEX IF NOT EXISTS idx_mcp_log_time_agent ON mcp_request_log(created_at, token_name);
+
+-- ============================================================
 -- files: binary attachments stored in Supabase Storage
 -- ============================================================
 -- v0.18.0 Step 7: files gains source_id + page_id alongside the
@@ -611,6 +656,22 @@ CREATE TABLE IF NOT EXISTS subagent_rate_leases (
 CREATE INDEX IF NOT EXISTS idx_rate_leases_key_expires ON subagent_rate_leases (key, expires_at);
 
 -- ============================================================
+-- Dream-cycle significance verdict cache — v0.21 synthesize phase
+-- ============================================================
+-- Caches the cheap Haiku "is this transcript worth processing?" verdict
+-- per (file_path, content_hash) so backfill re-runs skip already-judged
+-- files. Distinct from raw_data (which is page-scoped); transcripts
+-- aren't pages.
+CREATE TABLE IF NOT EXISTS dream_verdicts (
+  file_path        TEXT        NOT NULL,
+  content_hash     TEXT        NOT NULL,
+  worth_processing BOOLEAN     NOT NULL,
+  reasons          JSONB,
+  judged_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (file_path, content_hash)
+);
+
+-- ============================================================
 -- Cycle coordination lock — v0.17 runCycle primitive
 -- ============================================================
 -- One row per active cycle. Any caller (autopilot daemon, Minions
@@ -627,6 +688,42 @@ CREATE TABLE IF NOT EXISTS gbrain_cycle_locks (
   ttl_expires_at  TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_cycle_locks_ttl ON gbrain_cycle_locks(ttl_expires_at);
+
+-- ============================================================
+-- Eval capture (v0.25.0 — BrainBench-Real substrate)
+-- ============================================================
+-- eval_candidates: captured query/search calls from the op-layer wrapper
+-- in src/core/operations.ts. PII is scrubbed before insert by
+-- src/core/eval-capture-scrub.ts. query is CHECK-capped at 50KB.
+-- eval_capture_failures: cross-process audit of insert failures, surfaced
+-- by \`gbrain doctor\` (in-process counters can't bridge MCP server + doctor
+-- CLI process boundaries).
+CREATE TABLE IF NOT EXISTS eval_candidates (
+  id                    SERIAL PRIMARY KEY,
+  tool_name             TEXT         NOT NULL CHECK (tool_name IN ('query', 'search')),
+  query                 TEXT         NOT NULL CHECK (length(query) <= 51200),
+  retrieved_slugs       TEXT[]       NOT NULL DEFAULT '{}',
+  retrieved_chunk_ids   INTEGER[]    NOT NULL DEFAULT '{}',
+  source_ids            TEXT[]       NOT NULL DEFAULT '{}',
+  expand_enabled        BOOLEAN,
+  detail                TEXT         CHECK (detail IS NULL OR detail IN ('low', 'medium', 'high')),
+  detail_resolved       TEXT         CHECK (detail_resolved IS NULL OR detail_resolved IN ('low', 'medium', 'high')),
+  vector_enabled        BOOLEAN      NOT NULL,
+  expansion_applied     BOOLEAN      NOT NULL,
+  latency_ms            INTEGER      NOT NULL,
+  remote                BOOLEAN      NOT NULL,
+  job_id                INTEGER,
+  subagent_id           INTEGER,
+  created_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_eval_candidates_created_at ON eval_candidates(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS eval_capture_failures (
+  id      SERIAL       PRIMARY KEY,
+  ts      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  reason  TEXT         NOT NULL CHECK (reason IN ('db_down', 'rls_reject', 'check_violation', 'scrubber_exception', 'other'))
+);
+CREATE INDEX IF NOT EXISTS idx_eval_capture_failures_ts ON eval_capture_failures(ts DESC);
 
 -- NOTIFY trigger for real-time job events (Postgres only, not PGLite)
 CREATE OR REPLACE FUNCTION notify_minion_job_change() RETURNS trigger AS \$\$
@@ -677,6 +774,13 @@ BEGIN
     ALTER TABLE subagent_tool_executions ENABLE ROW LEVEL SECURITY;
     ALTER TABLE subagent_rate_leases ENABLE ROW LEVEL SECURITY;
     ALTER TABLE gbrain_cycle_locks ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE dream_verdicts ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE eval_candidates ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE eval_capture_failures ENABLE ROW LEVEL SECURITY;
+    -- v0.26 OAuth 2.1 tables
+    ALTER TABLE oauth_clients ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE oauth_tokens ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE oauth_codes ENABLE ROW LEVEL SECURITY;
     RAISE NOTICE 'RLS enabled on all tables (role % has BYPASSRLS)', current_user;
   ELSE
     RAISE WARNING 'Skipping RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;

@@ -2,7 +2,7 @@ import { PGlite } from '@electric-sql/pglite';
 import { vector } from '@electric-sql/pglite/vector';
 import { pg_trgm } from '@electric-sql/pglite/contrib/pg_trgm';
 import type { Transaction } from '@electric-sql/pglite';
-import type { BrainEngine, LinkBatchInput, TimelineBatchInput, ReservedConnection } from './engine.ts';
+import type { BrainEngine, LinkBatchInput, TimelineBatchInput, ReservedConnection, DreamVerdict, DreamVerdictInput } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { runMigrations } from './migrate.ts';
 import { PGLITE_SCHEMA_SQL } from './pglite-schema.ts';
@@ -18,6 +18,8 @@ import type {
   BrainStats, BrainHealth,
   IngestLogEntry, IngestLogInput,
   EngineConfig,
+  EvalCandidate, EvalCandidateInput,
+  EvalCaptureFailure, EvalCaptureFailureReason,
 } from './types.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
@@ -25,10 +27,86 @@ import { buildSourceFactorCase, buildHardExcludeClause } from './search/sql-rank
 
 type PGLiteDB = PGlite;
 
+// Tier 3 snapshot fast-restore. Reads a tar dump produced by
+// `bun run scripts/build-pglite-snapshot.ts`. Snapshot is matched against
+// the current MIGRATIONS hash via a sidecar `.version` file; on mismatch we
+// silently fall through to a normal initSchema (snapshot is just an
+// optimization, never authoritative).
+let _snapshotWarnLogged = false;
+function tryLoadSnapshot(snapshotPath: string): Blob | null {
+  try {
+    // Lazy require so production builds without these imports don't crash.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require('node:fs') as typeof import('node:fs');
+    const crypto = require('node:crypto') as typeof import('node:crypto');
+    const { MIGRATIONS } = require('./migrate.ts') as typeof import('./migrate.ts');
+    const { PGLITE_SCHEMA_SQL } = require('./pglite-schema.ts') as typeof import('./pglite-schema.ts');
+
+    if (!fs.existsSync(snapshotPath)) {
+      if (!_snapshotWarnLogged) {
+        // eslint-disable-next-line no-console
+        console.warn(`[pglite] GBRAIN_PGLITE_SNAPSHOT set but file missing: ${snapshotPath} — using normal init.`);
+        _snapshotWarnLogged = true;
+      }
+      return null;
+    }
+    const versionPath = snapshotPath.replace(/\.tar(?:\.gz)?$/, '.version');
+    if (!fs.existsSync(versionPath)) {
+      if (!_snapshotWarnLogged) {
+        // eslint-disable-next-line no-console
+        console.warn(`[pglite] snapshot version file missing: ${versionPath} — using normal init.`);
+        _snapshotWarnLogged = true;
+      }
+      return null;
+    }
+    const expectedHash = computeSnapshotSchemaHash(MIGRATIONS, PGLITE_SCHEMA_SQL, crypto);
+    const actualHash = fs.readFileSync(versionPath, 'utf8').trim();
+    if (expectedHash !== actualHash) {
+      if (!_snapshotWarnLogged) {
+        // eslint-disable-next-line no-console
+        console.warn(`[pglite] snapshot stale (schema hash mismatch) — using normal init. Rebuild with: bun run build:pglite-snapshot`);
+        _snapshotWarnLogged = true;
+      }
+      return null;
+    }
+    const buf = fs.readFileSync(snapshotPath);
+    return new Blob([buf]);
+  } catch {
+    // Any failure -> fall through to normal init. Never block tests.
+    return null;
+  }
+}
+
+export function computeSnapshotSchemaHash(
+  migrations: Array<{ version: number; name: string; sql?: string; sqlFor?: { pglite?: string } }>,
+  schemaSQL: string,
+  crypto: typeof import('node:crypto'),
+): string {
+  const hash = crypto.createHash('sha256');
+  hash.update('schema:');
+  hash.update(schemaSQL);
+  hash.update('\nmigrations:\n');
+  for (const m of migrations) {
+    hash.update(String(m.version));
+    hash.update('\t');
+    hash.update(m.name);
+    hash.update('\t');
+    hash.update(m.sql ?? '');
+    hash.update('\t');
+    hash.update(m.sqlFor?.pglite ?? '');
+    hash.update('\n');
+  }
+  return hash.digest('hex');
+}
+
 export class PGLiteEngine implements BrainEngine {
   readonly kind = 'pglite' as const;
   private _db: PGLiteDB | null = null;
   private _lock: LockHandle | null = null;
+  // Tier 3: when GBRAIN_PGLITE_SNAPSHOT loaded a post-initSchema state into
+  // PGlite.create(loadDataDir), initSchema is a no-op (schema is already
+  // present + migrations already applied). Saves ~1-3s per fresh test PGLite.
+  private _snapshotLoaded = false;
 
   get db(): PGLiteDB {
     if (!this._db) throw new Error('PGLite not connected. Call connect() first.');
@@ -46,9 +124,24 @@ export class PGLiteEngine implements BrainEngine {
       throw new Error('Could not acquire PGLite lock. Another gbrain process is using the database.');
     }
 
+    // Tier 3: optional snapshot fast-restore. Only applies to in-memory
+    // engines (no persistent dataDir). The snapshot was built from a fresh
+    // `initSchema()` run; if the version file matches the current MIGRATIONS
+    // hash, load the dump and skip the schema replay. Mismatch or missing
+    // file silently falls back to normal init.
+    let loadDataDir: Blob | undefined;
+    if (!dataDir && process.env.GBRAIN_PGLITE_SNAPSHOT) {
+      const snapshotResult = tryLoadSnapshot(process.env.GBRAIN_PGLITE_SNAPSHOT);
+      if (snapshotResult) {
+        loadDataDir = snapshotResult;
+        this._snapshotLoaded = true;
+      }
+    }
+
     try {
       this._db = await PGlite.create({
         dataDir,
+        loadDataDir,
         extensions: { vector, pg_trgm },
       });
     } catch (err) {
@@ -86,11 +179,131 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async initSchema(): Promise<void> {
+    // Tier 3: snapshot was loaded into PGlite — schema + migrations already
+    // applied. Nothing to do. Returns immediately.
+    if (this._snapshotLoaded) {
+      return;
+    }
+    // Pre-schema bootstrap: add forward-referenced state the embedded schema
+    // blob requires but that older brains don't have yet. Without this, a
+    // pre-v0.18 brain hits `CREATE INDEX idx_pages_source_id ON pages(source_id)`
+    // (issues #366/#375/#378/#396) or a pre-v0.13 brain hits
+    // `CREATE INDEX idx_links_source ON links(link_source)` (#266/#357), and
+    // initSchema crashes before runMigrations gets a chance to apply the
+    // missing column. Bootstrap is structurally idempotent and a no-op on
+    // fresh installs and modern brains.
+    await this.applyForwardReferenceBootstrap();
+
     await this.db.exec(PGLITE_SCHEMA_SQL);
 
     const { applied } = await runMigrations(this);
     if (applied > 0) {
       console.log(`  ${applied} migration(s) applied`);
+    }
+  }
+
+  /**
+   * Bootstrap state that PGLITE_SCHEMA_SQL forward-references but that older
+   * brains don't have yet. Currently covers:
+   *
+   *   - `sources` table + default seed (FK target of pages.source_id) — v0.18
+   *   - `pages.source_id` column (indexed by `idx_pages_source_id`) — v0.18
+   *   - `links.link_source` column (indexed by `idx_links_source`) — v0.13
+   *   - `links.origin_page_id` column (indexed by `idx_links_origin`) — v0.13
+   *   - `content_chunks.symbol_name` column (indexed by `idx_chunks_symbol_name`) — v0.19
+   *   - `content_chunks.language` column (indexed by `idx_chunks_language`) — v0.19
+   *
+   * **Maintenance contract:** when a future migration adds a column-with-index
+   * or new-table-with-FK referenced by PGLITE_SCHEMA_SQL, extend this method
+   * AND `test/schema-bootstrap-coverage.test.ts`'s `REQUIRED_BOOTSTRAP_COVERAGE`.
+   * The coverage test fails loudly if the bootstrap drifts behind the schema.
+   */
+  private async applyForwardReferenceBootstrap(): Promise<void> {
+    // Single round-trip probe for every forward-reference target.
+    const { rows } = await this.db.query(`
+      SELECT
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='pages') AS pages_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='pages' AND column_name='source_id') AS source_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='links') AS links_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='links' AND column_name='link_source') AS link_source_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='links' AND column_name='origin_page_id') AS origin_page_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='content_chunks') AS chunks_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='content_chunks' AND column_name='symbol_name') AS symbol_name_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='content_chunks' AND column_name='language') AS language_exists
+    `);
+    const probe = rows[0] as {
+      pages_exists: boolean;
+      source_id_exists: boolean;
+      links_exists: boolean;
+      link_source_exists: boolean;
+      origin_page_id_exists: boolean;
+      chunks_exists: boolean;
+      symbol_name_exists: boolean;
+      language_exists: boolean;
+    };
+
+    const needsPagesBootstrap = probe.pages_exists && !probe.source_id_exists;
+    const needsLinksBootstrap = probe.links_exists
+      && (!probe.link_source_exists || !probe.origin_page_id_exists);
+    const needsChunksBootstrap = probe.chunks_exists
+      && (!probe.symbol_name_exists || !probe.language_exists);
+
+    // Fresh installs (no tables yet) and modern brains both no-op.
+    if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap) return;
+
+    console.log('  Pre-v0.21 brain detected, applying forward-reference bootstrap');
+
+    if (needsPagesBootstrap) {
+      // Mirror schema-embedded.ts shape for `sources` so the subsequent
+      // PGLITE_SCHEMA_SQL CREATE TABLE IF NOT EXISTS is a true no-op.
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS sources (
+          id            TEXT PRIMARY KEY,
+          name          TEXT NOT NULL UNIQUE,
+          local_path    TEXT,
+          last_commit   TEXT,
+          last_sync_at  TIMESTAMPTZ,
+          config        JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        INSERT INTO sources (id, name, config)
+          VALUES ('default', 'default', '{"federated": true}'::jsonb)
+          ON CONFLICT (id) DO NOTHING;
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS source_id TEXT
+          NOT NULL DEFAULT 'default' REFERENCES sources(id) ON DELETE CASCADE;
+      `);
+    }
+
+    if (needsLinksBootstrap) {
+      // v11 (links_provenance_columns) is responsible for the CHECK constraint
+      // and backfill. The bootstrap only adds enough state for SCHEMA_SQL's
+      // `CREATE INDEX idx_links_source/origin` not to crash. v11 runs later
+      // via runMigrations and is idempotent (`IF NOT EXISTS` everywhere).
+      await this.db.exec(`
+        ALTER TABLE links ADD COLUMN IF NOT EXISTS link_source TEXT;
+        ALTER TABLE links ADD COLUMN IF NOT EXISTS origin_page_id INTEGER
+          REFERENCES pages(id) ON DELETE SET NULL;
+      `);
+    }
+
+    if (needsChunksBootstrap) {
+      // v26 (content_chunks_code_metadata) adds the full code-chunk metadata
+      // surface (language, symbol_name, symbol_type, start_line, end_line).
+      // The bootstrap only adds the two columns the schema blob's partial
+      // indexes reference (idx_chunks_symbol_name, idx_chunks_language).
+      // v26 runs later via runMigrations and adds the rest idempotently.
+      await this.db.exec(`
+        ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS language TEXT;
+        ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS symbol_name TEXT;
+      `);
     }
   }
 
@@ -178,6 +391,13 @@ export class PGLiteEngine implements BrainEngine {
     if (filters?.updated_after) {
       params.push(filters.updated_after);
       where.push(`p.updated_at > $${params.length}::timestamptz`);
+    }
+    // slugPrefix uses the (source_id, slug) UNIQUE btree for index range scans.
+    // Escape LIKE metacharacters so the user prefix is treated as a literal.
+    if (filters?.slugPrefix) {
+      const escaped = filters.slugPrefix.replace(/[\\%_]/g, (c) => '\\' + c) + '%';
+      params.push(escaped);
+      where.push(`p.slug LIKE $${params.length} ESCAPE '\\'`);
     }
 
     const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
@@ -1035,6 +1255,39 @@ export class PGLiteEngine implements BrainEngine {
     return result.rows as unknown as RawData[];
   }
 
+  // Dream-cycle significance verdict cache (v0.23).
+  async getDreamVerdict(filePath: string, contentHash: string): Promise<DreamVerdict | null> {
+    const result = await this.db.query<{
+      worth_processing: boolean;
+      reasons: string[] | null;
+      judged_at: Date | string;
+    }>(
+      `SELECT worth_processing, reasons, judged_at
+       FROM dream_verdicts
+       WHERE file_path = $1 AND content_hash = $2`,
+      [filePath, contentHash]
+    );
+    if (result.rows.length === 0) return null;
+    const r = result.rows[0];
+    return {
+      worth_processing: r.worth_processing,
+      reasons: r.reasons ?? [],
+      judged_at: r.judged_at instanceof Date ? r.judged_at.toISOString() : String(r.judged_at),
+    };
+  }
+
+  async putDreamVerdict(filePath: string, contentHash: string, verdict: DreamVerdictInput): Promise<void> {
+    await this.db.query(
+      `INSERT INTO dream_verdicts (file_path, content_hash, worth_processing, reasons)
+       VALUES ($1, $2, $3, $4::jsonb)
+       ON CONFLICT (file_path, content_hash) DO UPDATE SET
+         worth_processing = EXCLUDED.worth_processing,
+         reasons = EXCLUDED.reasons,
+         judged_at = now()`,
+      [filePath, contentHash, verdict.worth_processing, JSON.stringify(verdict.reasons)]
+    );
+  }
+
   // Versions
   async createVersion(slug: string): Promise<PageVersion> {
     const { rows } = await this.db.query(
@@ -1422,6 +1675,82 @@ export class PGLiteEngine implements BrainEngine {
     return (rows as Record<string, unknown>[]).map(rowToCodeEdge);
   }
 
+  // Eval capture (v0.25.0). See BrainEngine interface docs.
+  async logEvalCandidate(input: EvalCandidateInput): Promise<number> {
+    const { rows } = await this.db.query<{ id: number }>(
+      `INSERT INTO eval_candidates (
+         tool_name, query, retrieved_slugs, retrieved_chunk_ids, source_ids,
+         expand_enabled, detail, detail_resolved, vector_enabled, expansion_applied,
+         latency_ms, remote, job_id, subagent_id
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+       RETURNING id`,
+      [
+        input.tool_name,
+        input.query,
+        input.retrieved_slugs,
+        input.retrieved_chunk_ids,
+        input.source_ids,
+        input.expand_enabled,
+        input.detail,
+        input.detail_resolved,
+        input.vector_enabled,
+        input.expansion_applied,
+        input.latency_ms,
+        input.remote,
+        input.job_id,
+        input.subagent_id,
+      ]
+    );
+    return rows[0]!.id;
+  }
+
+  async listEvalCandidates(filter?: { since?: Date; limit?: number; tool?: 'query' | 'search' }): Promise<EvalCandidate[]> {
+    const raw = filter?.limit;
+    const limit = (raw === undefined || raw === null || !Number.isFinite(raw) || raw <= 0)
+      ? 1000
+      : Math.min(Math.floor(raw), 100000);
+    const since = filter?.since ?? new Date(0);
+    const tool = filter?.tool ?? null;
+    // id DESC tiebreaker — see postgres-engine for rationale.
+    const { rows } = tool
+      ? await this.db.query(
+          `SELECT * FROM eval_candidates
+           WHERE created_at >= $1 AND tool_name = $2
+           ORDER BY created_at DESC, id DESC LIMIT $3`,
+          [since, tool, limit]
+        )
+      : await this.db.query(
+          `SELECT * FROM eval_candidates
+           WHERE created_at >= $1
+           ORDER BY created_at DESC, id DESC LIMIT $2`,
+          [since, limit]
+        );
+    return rows as unknown as EvalCandidate[];
+  }
+
+  async deleteEvalCandidatesBefore(date: Date): Promise<number> {
+    const { rows } = await this.db.query(
+      `DELETE FROM eval_candidates WHERE created_at < $1 RETURNING id`,
+      [date]
+    );
+    return rows.length;
+  }
+
+  async logEvalCaptureFailure(reason: EvalCaptureFailureReason): Promise<void> {
+    await this.db.query(
+      `INSERT INTO eval_capture_failures (reason) VALUES ($1)`,
+      [reason]
+    );
+  }
+
+  async listEvalCaptureFailures(filter?: { since?: Date }): Promise<EvalCaptureFailure[]> {
+    const since = filter?.since ?? new Date(0);
+    const { rows } = await this.db.query(
+      `SELECT * FROM eval_capture_failures WHERE ts >= $1 ORDER BY ts DESC`,
+      [since]
+    );
+    return rows as unknown as EvalCaptureFailure[];
+  }
 }
 
 function rowToCodeEdge(row: Record<string, unknown>): import('./types.ts').CodeEdgeResult {

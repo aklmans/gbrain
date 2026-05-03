@@ -19,7 +19,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'repos', 'code-def', 'code-refs', 'reindex-code', 'code-callers', 'code-callees', 'frontmatter']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'storage', 'repos', 'code-def', 'code-refs', 'reindex-code', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror']);
 
 async function main() {
   // Parse global flags (--quiet / --progress-json / --progress-interval)
@@ -265,6 +265,11 @@ async function handleCliOnly(command: string, args: string[]) {
     await runInit(args);
     return;
   }
+  if (command === 'auth') {
+    const { runAuth } = await import('./commands/auth.ts');
+    await runAuth(args);
+    return;
+  }
   if (command === 'upgrade') {
     const { runUpgrade } = await import('./commands/upgrade.ts');
     await runUpgrade(args);
@@ -283,6 +288,11 @@ async function handleCliOnly(command: string, args: string[]) {
   if (command === 'integrations') {
     const { runIntegrations } = await import('./commands/integrations.ts');
     await runIntegrations(args);
+    return;
+  }
+  if (command === 'auth') {
+    const { runAuth } = await import('./commands/auth.ts');
+    await runAuth(args);
     return;
   }
   if (command === 'resolvers') {
@@ -320,6 +330,13 @@ async function handleCliOnly(command: string, args: string[]) {
     await runCheckResolvable(args);
     return;
   }
+  if (command === 'mounts') {
+    // No DB needed: mounts.json is a local config file. Registry will
+    // connect mount engines lazily on first use by op dispatch.
+    const { runMounts } = await import('./commands/mounts.ts');
+    await runMounts(args);
+    return;
+  }
   if (command === 'routing-eval') {
     const { runRoutingEvalCli } = await import('./commands/routing-eval.ts');
     await runRoutingEvalCli(args);
@@ -337,6 +354,14 @@ async function handleCliOnly(command: string, args: string[]) {
     // subArgs already has `skillpack` stripped; args[0] is the subcommand.
     await runSkillpack(args);
     return;
+  }
+  if (command === 'friction') {
+    const { runFriction } = await import('./commands/friction.ts');
+    process.exit(runFriction(args));
+  }
+  if (command === 'claw-test') {
+    const { runClawTest } = await import('./commands/claw-test.ts');
+    process.exit(await runClawTest(args));
   }
   if (command === 'report') {
     const { runReport } = await import('./commands/report.ts');
@@ -447,7 +472,7 @@ async function handleCliOnly(command: string, args: string[]) {
       }
       case 'serve': {
         const { runServe } = await import('./commands/serve.ts');
-        await runServe(engine);
+        await runServe(engine, args);
         return; // serve doesn't disconnect
       }
       case 'call': {
@@ -479,6 +504,11 @@ async function handleCliOnly(command: string, args: string[]) {
       case 'agent': {
         const { runAgent } = await import('./commands/agent.ts');
         await runAgent(engine, args);
+        break;
+      }
+      case 'book-mirror': {
+        const { runBookMirrorCmd } = await import('./commands/book-mirror.ts');
+        await runBookMirrorCmd(engine, args);
         break;
       }
       case 'sync': {
@@ -525,6 +555,11 @@ async function handleCliOnly(command: string, args: string[]) {
         await runSources(engine, args);
         break;
       }
+      case 'storage': {
+        const { runStorage } = await import('./commands/storage.ts');
+        await runStorage(engine, args);
+        break;
+      }
       case 'code-def': {
         const { runCodeDef } = await import('./commands/code-def.ts');
         await runCodeDef(engine, args);
@@ -557,7 +592,7 @@ async function handleCliOnly(command: string, args: string[]) {
       }
       case 'repos': {
         // v0.19.0: `gbrain repos ...` is an alias into the v0.18.0 sources
-        // subsystem. The repos abstraction (Wintermute's baseline) was
+        // subsystem. The repos abstraction (Garry's OpenClaw baseline) was
         // redundant with sources and carried per-user config state that
         // couldn't participate in federation / RLS / multi-tenancy. We
         // keep the alias so scripts like `gbrain repos add .` keep
@@ -640,6 +675,8 @@ IMPORT/EXPORT
   sync --watch [--interval N]        Continuous sync (loops until stopped)
   sync --install-cron                Install persistent sync daemon
   export [--dir ./out/]              Export to markdown
+  export --restore-only [--repo <p>] Restore missing supabase-only files
+        [--type T] [--slug-prefix S] With optional filters
 
 FILES
   files list [slug]                  List stored files
@@ -721,7 +758,13 @@ ADMIN
   features [--json] [--auto-fix]     Scan usage + recommend unused features
   autopilot [--repo] [--interval N]  Self-maintaining brain daemon
   config [show|get|set] <key> [val]  Brain config
+  storage status [--repo <path>]     Storage tier status and health
+        [--json]                     (git-tracked vs supabase-only)
   serve                              MCP server (stdio)
+  serve --http [--port N]            HTTP MCP server with OAuth 2.1
+    --token-ttl N                    Access token TTL in seconds (default: 3600)
+    --enable-dcr                     Enable Dynamic Client Registration
+    --public-url URL                 Public issuer URL (required behind proxy/tunnel)
   call <tool> '<json>'               Raw tool invocation
   version                            Version info
   --tools-json                       Tool discovery (JSON)
