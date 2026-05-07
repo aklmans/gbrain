@@ -21,6 +21,14 @@ const VOYAGE_OUTPUT_DIMENSION_MODELS = new Set([
   'voyage-code-3',
 ]);
 
+function isOpenAIStyleFlexibleEmbeddingModel(modelId: string): boolean {
+  return (
+    modelId.startsWith('text-embedding-3') ||
+    modelId.startsWith('text-embedding-4') ||
+    modelId.startsWith('text-embedding-v4')
+  );
+}
+
 /**
  * Build the providerOptions blob for embedMany() that pins output dimensions.
  *
@@ -53,8 +61,14 @@ export function dimsProviderOptions(
       return undefined;
     case 'openai-compatible':
       // Most openai-compatible providers (Ollama, LM Studio, vLLM, LiteLLM)
-      // do not expose a standard dimensions knob. Voyage's compat endpoint is
-      // the exception: it accepts output_dimension and defaults to 1024 dims.
+      // do not expose a standard dimensions knob. OpenAI-style embedding
+      // models served through compatible gateways (including DashScope
+      // text-embedding-v4 via GBRAIN_EMBED_*) accept the standard
+      // `dimensions` request field. Voyage's compat endpoint is the other
+      // known exception: it accepts output_dimension and defaults to 1024 dims.
+      if (isOpenAIStyleFlexibleEmbeddingModel(modelId)) {
+        return { openaiCompatible: { dimensions: dims } };
+      }
       if (VOYAGE_OUTPUT_DIMENSION_MODELS.has(modelId)) {
         return { openaiCompatible: { output_dimension: dims } };
       }

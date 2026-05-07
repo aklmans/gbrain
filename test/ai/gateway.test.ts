@@ -156,6 +156,11 @@ describe('dims.dimsProviderOptions', () => {
     expect(opts).toBeUndefined();
   });
 
+  test('openai-compatible OpenAI-style embedding models return dimensions', () => {
+    const opts = dimsProviderOptions('openai-compatible', 'text-embedding-v4', 1536);
+    expect(opts).toEqual({ openaiCompatible: { dimensions: 1536 } });
+  });
+
   test('Voyage openai-compatible returns output_dimension', () => {
     const opts = dimsProviderOptions('openai-compatible', 'voyage-4-large', 2048);
     expect(opts).toEqual({ openaiCompatible: { output_dimension: 2048 } });
