@@ -1073,6 +1073,200 @@ export const MIGRATIONS: Migration[] = [
     },
     sql: '',
   },
+  // NOTE: v37 + v38 are the v0.28 takes migrations. Renumbered four times during
+  // the long-lived v0.28 branch as master shipped:
+  //   v0.28 originally targeted v31/v32
+  //   master v0.25 claimed v31 (eval_capture_tables) → renumbered to v32/v33
+  //   master v0.26 claimed v32 (oauth_infrastructure) and v33
+  //     (admin_dashboard_columns_v0_26_3) → renumbered to v34/v35
+  //   master v0.26.5 claimed v34 (destructive_guard_columns) → renumbered to v35/v36
+  //   master v0.26.8 + v0.27 claimed v35 (auto_rls_event_trigger) and v36
+  //     (subagent_provider_neutral_persistence_v0_27) → renumbered to v37/v38
+  // Runtime sort by version ascending means source-order doesn't matter.
+  {
+    version: 37,
+    name: 'takes_and_synthesis_evidence',
+    // v0.28: typed/weighted/attributed claims ("takes") + synthesis provenance.
+    // Spec: docs/designs (CEO plan) + plan file. Schema decisions:
+    //   - page_id FK (not page_slug) — pages.slug is unique only within source
+    //   - (page_id, row_num) is the natural unique key (composite, append-only)
+    //   - synthesis_evidence FK ON DELETE CASCADE — when a source take is hard-deleted,
+    //     provenance rows go with it; synthesis renderer marks citations as removed
+    //   - HNSW index on embedding (pgvector 0.7+ supports both Postgres + PGLite)
+    //   - resolved_* columns ship now per CEO-review D4 + Codex P1 #13 (immutable)
+    sql: `
+      CREATE TABLE IF NOT EXISTS takes (
+        id               BIGSERIAL PRIMARY KEY,
+        page_id          INTEGER     NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+        row_num          INTEGER     NOT NULL,
+        claim            TEXT        NOT NULL,
+        kind             TEXT        NOT NULL CHECK (kind IN ('fact','take','bet','hunch')),
+        holder           TEXT        NOT NULL,
+        weight           REAL        NOT NULL DEFAULT 0.5 CHECK (weight >= 0 AND weight <= 1),
+        since_date       TEXT,
+        until_date       TEXT,
+        source           TEXT,
+        superseded_by    INTEGER,
+        active           BOOLEAN     NOT NULL DEFAULT TRUE,
+        resolved_at      TIMESTAMPTZ,
+        resolved_outcome BOOLEAN,
+        resolved_value   REAL,
+        resolved_unit    TEXT,
+        resolved_source  TEXT,
+        resolved_by      TEXT,
+        embedding        VECTOR(1536),
+        embedded_at      TIMESTAMPTZ,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT takes_page_row_key UNIQUE (page_id, row_num)
+      );
+      CREATE INDEX IF NOT EXISTS idx_takes_page          ON takes(page_id);
+      CREATE INDEX IF NOT EXISTS idx_takes_kind_active   ON takes(kind)   WHERE active;
+      CREATE INDEX IF NOT EXISTS idx_takes_holder_active ON takes(holder) WHERE active;
+      CREATE INDEX IF NOT EXISTS idx_takes_weight_active ON takes(weight DESC) WHERE active;
+      CREATE INDEX IF NOT EXISTS idx_takes_resolved_at   ON takes(resolved_at) WHERE resolved_at IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_takes_embedding_hnsw ON takes
+        USING hnsw (embedding vector_cosine_ops)
+        WHERE active AND embedding IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS synthesis_evidence (
+        synthesis_page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+        take_page_id      INTEGER NOT NULL,
+        take_row_num      INTEGER NOT NULL,
+        citation_index    INTEGER NOT NULL,
+        created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (synthesis_page_id, take_page_id, take_row_num),
+        FOREIGN KEY (take_page_id, take_row_num)
+          REFERENCES takes(page_id, row_num) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_synthesis_evidence_take
+        ON synthesis_evidence(take_page_id, take_row_num);
+
+      DO $$
+      DECLARE
+        has_bypass BOOLEAN;
+      BEGIN
+        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        IF has_bypass THEN
+          ALTER TABLE takes              ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE synthesis_evidence ENABLE ROW LEVEL SECURITY;
+        END IF;
+      END $$;
+    `,
+    sqlFor: {
+      // PGLite: same DDL minus the RLS DO-block (no rolbypassrls). Same HNSW
+      // index syntax — pgvector 0.7+ supports it. Same FK semantics.
+      pglite: `
+        CREATE TABLE IF NOT EXISTS takes (
+          id               BIGSERIAL PRIMARY KEY,
+          page_id          INTEGER     NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+          row_num          INTEGER     NOT NULL,
+          claim            TEXT        NOT NULL,
+          kind             TEXT        NOT NULL CHECK (kind IN ('fact','take','bet','hunch')),
+          holder           TEXT        NOT NULL,
+          weight           REAL        NOT NULL DEFAULT 0.5 CHECK (weight >= 0 AND weight <= 1),
+          since_date       TEXT,
+          until_date       TEXT,
+          source           TEXT,
+          superseded_by    INTEGER,
+          active           BOOLEAN     NOT NULL DEFAULT TRUE,
+          resolved_at      TIMESTAMPTZ,
+          resolved_outcome BOOLEAN,
+          resolved_value   REAL,
+          resolved_unit    TEXT,
+          resolved_source  TEXT,
+          resolved_by      TEXT,
+          embedding        VECTOR(1536),
+          embedded_at      TIMESTAMPTZ,
+          created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+          CONSTRAINT takes_page_row_key UNIQUE (page_id, row_num)
+        );
+        CREATE INDEX IF NOT EXISTS idx_takes_page          ON takes(page_id);
+        CREATE INDEX IF NOT EXISTS idx_takes_kind_active   ON takes(kind)   WHERE active;
+        CREATE INDEX IF NOT EXISTS idx_takes_holder_active ON takes(holder) WHERE active;
+        CREATE INDEX IF NOT EXISTS idx_takes_weight_active ON takes(weight DESC) WHERE active;
+        CREATE INDEX IF NOT EXISTS idx_takes_resolved_at   ON takes(resolved_at) WHERE resolved_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_takes_embedding_hnsw ON takes
+          USING hnsw (embedding vector_cosine_ops)
+          WHERE active AND embedding IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS synthesis_evidence (
+          synthesis_page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+          take_page_id      INTEGER NOT NULL,
+          take_row_num      INTEGER NOT NULL,
+          citation_index    INTEGER NOT NULL,
+          created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (synthesis_page_id, take_page_id, take_row_num),
+          FOREIGN KEY (take_page_id, take_row_num)
+            REFERENCES takes(page_id, row_num) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_synthesis_evidence_take
+          ON synthesis_evidence(take_page_id, take_row_num);
+      `,
+    },
+  },
+  {
+    version: 38,
+    name: 'access_tokens_permissions',
+    // v0.28: per-token allow-list for takes visibility (Codex P0 #3 partial fix).
+    // The complementary fix (chunker strips fenced takes content from page chunks
+    // so query results don't bypass the allow-list) lives in src/core/chunkers/takes-strip.ts.
+    // Default permissions = {takes_holders: ['world']} keeps non-world takes (hunches,
+    // private opinions) hidden from MCP-bound tokens until the operator explicitly
+    // grants access via `gbrain auth permissions <id> set-takes-holders`.
+    sql: `
+      ALTER TABLE access_tokens
+        ADD COLUMN IF NOT EXISTS permissions JSONB
+          NOT NULL DEFAULT '{"takes_holders":["world"]}'::jsonb;
+
+      -- Backfill existing tokens to the default. NOT NULL DEFAULT covers new rows;
+      -- this UPDATE handles any pre-existing rows from before the column was added.
+      UPDATE access_tokens
+        SET permissions = '{"takes_holders":["world"]}'::jsonb
+        WHERE permissions IS NULL OR permissions = '{}'::jsonb;
+    `,
+  },
+  {
+    version: 39,
+    name: 'files_source_id_fk_repair',
+    // v0.28.8 fork hardening: v23 used
+    // `ADD COLUMN IF NOT EXISTS source_id ... REFERENCES sources(id)`.
+    // On databases where a prior schema/bootstrap already created
+    // files.source_id without the FK, that statement no-ops and never adds
+    // ON DELETE CASCADE. Repair the constraint explicitly so removing a source
+    // also removes its file rows.
+    sql: '',
+    sqlFor: {
+      postgres: `
+        DO $$
+        BEGIN
+          IF to_regclass('public.files') IS NOT NULL THEN
+            INSERT INTO sources (id, name, config)
+              VALUES ('default', 'default', '{"federated": true}'::jsonb)
+              ON CONFLICT (id) DO NOTHING;
+
+            UPDATE files f
+               SET source_id = 'default'
+             WHERE source_id IS NULL
+                OR NOT EXISTS (SELECT 1 FROM sources s WHERE s.id = f.source_id);
+
+            IF NOT EXISTS (
+              SELECT 1
+                FROM pg_constraint
+               WHERE conrelid = 'files'::regclass
+                 AND conname = 'files_source_id_fkey'
+            ) THEN
+              ALTER TABLE files
+                ADD CONSTRAINT files_source_id_fkey
+                FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE;
+            END IF;
+          END IF;
+        END $$;
+      `,
+      pglite: '',
+    },
+  },
   {
     version: 30,
     name: 'dream_verdicts_table',
@@ -1263,6 +1457,278 @@ export const MIGRATIONS: Migration[] = [
       END $$;
     `,
   },
+  {
+    version: 33,
+    name: 'admin_dashboard_columns_v0_26_3',
+    // v0.26.3 admin dashboard expansion. Adds 5 columns referenced by
+    // src/commands/serve-http.ts and src/core/oauth-provider.ts that landed
+    // in PR #586 without a corresponding schema migration. Without v33,
+    // existing brains hit:
+    //   - SELECT c.token_ttl, ... CASE WHEN c.deleted_at -> 503 on /admin/api/agents
+    //   - INSERT INTO mcp_request_log (... agent_name, params, error_message)
+    //     -> caught by best-effort try/catch, request log silently empties
+    //   - UPDATE oauth_clients SET deleted_at = now() (revoke-client) -> 500
+    //   - UPDATE oauth_clients SET token_ttl = ... (update-client-ttl) -> 500
+    // All ALTERs use ADD COLUMN IF NOT EXISTS so re-running is a no-op.
+    sql: `
+      ALTER TABLE oauth_clients
+        ADD COLUMN IF NOT EXISTS token_ttl INTEGER,
+        ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+      ALTER TABLE mcp_request_log
+        ADD COLUMN IF NOT EXISTS agent_name TEXT,
+        ADD COLUMN IF NOT EXISTS params JSONB,
+        ADD COLUMN IF NOT EXISTS error_message TEXT;
+
+      -- Backfill agent_name on existing rows so the new "agent" column in
+      -- the request log isn't blank for pre-v0.26.3 entries. LEFT JOIN
+      -- pattern: prefer client_name from oauth_clients (current behavior),
+      -- fall back to access_tokens.name (legacy bearer tokens), fall back
+      -- to the raw client_id stored as token_name.
+      UPDATE mcp_request_log m
+      SET agent_name = COALESCE(
+        (SELECT client_name FROM oauth_clients WHERE client_id = m.token_name LIMIT 1),
+        (SELECT name FROM access_tokens WHERE name = m.token_name LIMIT 1),
+        m.token_name
+      )
+      WHERE agent_name IS NULL;
+
+      -- Index for the new agent filter on /admin/api/request-log. The
+      -- existing idx_mcp_log_time_agent (created_at, token_name) doesn't
+      -- help when filtering by the resolved agent_name. Use DESC on
+      -- created_at to match the typical ORDER BY clause.
+      CREATE INDEX IF NOT EXISTS idx_mcp_log_agent_time
+        ON mcp_request_log(agent_name, created_at DESC);
+    `,
+  },
+  {
+    version: 34,
+    name: 'destructive_guard_columns',
+    // v0.26.5 — soft-delete + recovery window for sources AND pages.
+    // Renumbered v33→v34 on master merge: master's v33 (admin_dashboard_columns_v0_26_3)
+    // landed first in PR #586. v34 follows it.
+    //
+    // pages.deleted_at: `delete_page` op now sets deleted_at = now() instead of
+    // hard-deleting. The autopilot purge phase hard-deletes rows where
+    // deleted_at < now() - 72h. Search and `get_page` filter
+    // `WHERE deleted_at IS NULL` by default; `include_deleted: true` opts in.
+    //
+    // sources.archived/archived_at/archive_expires_at: promoted from JSONB keys
+    // to real columns. v0.26.0 + the cherry-picked PR #595 wrote these inside
+    // `sources.config` JSONB. Real columns are faster to filter, avoid the
+    // reserved-key footgun, and let the search visibility filter compile to a
+    // column lookup. The 72h TTL is preserved by reading
+    // `archive_expires_at = archived_at + INTERVAL '72 hours'`.
+    //
+    // Backfill: any row that previously stored `{"archived":true,"archived_at":"...","archive_expires_at":"..."}`
+    // in config gets migrated to the new columns, then the keys are stripped
+    // from JSONB so the JSONB shape stays canonical going forward.
+    //
+    // Engine-aware partial index: Postgres uses CREATE INDEX CONCURRENTLY (no
+    // write-blocking lock); PGLite uses plain CREATE INDEX. Mirrors v14
+    // (pages_updated_at_index) handler shape.
+    sql: '',
+    handler: async (engine) => {
+      // 1. Add columns. ALTER TABLE ADD COLUMN IF NOT EXISTS is idempotent on
+      //    both engines.
+      await engine.runMigration(34, `
+        ALTER TABLE pages   ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+        ALTER TABLE sources ADD COLUMN IF NOT EXISTS archived           BOOLEAN     NOT NULL DEFAULT false;
+        ALTER TABLE sources ADD COLUMN IF NOT EXISTS archived_at        TIMESTAMPTZ;
+        ALTER TABLE sources ADD COLUMN IF NOT EXISTS archive_expires_at TIMESTAMPTZ;
+      `);
+
+      // 2. Backfill from JSONB shape used by pre-v0.26.5 cherry-picks of PR #595.
+      //    Idempotent: subsequent re-runs find zero matching rows.
+      await engine.runMigration(34, `
+        UPDATE sources
+        SET archived = true,
+            archived_at = COALESCE((config->>'archived_at')::timestamptz, now()),
+            archive_expires_at = COALESCE(
+              (config->>'archive_expires_at')::timestamptz,
+              COALESCE((config->>'archived_at')::timestamptz, now()) + INTERVAL '72 hours'
+            )
+        WHERE config ? 'archived'
+          AND (config->>'archived')::boolean = true
+          AND archived = false;
+      `);
+      await engine.runMigration(34, `
+        UPDATE sources
+        SET config = config - 'archived' - 'archived_at' - 'archive_expires_at'
+        WHERE config ?| ARRAY['archived', 'archived_at', 'archive_expires_at'];
+      `);
+
+      // 3. Partial index for the autopilot purge sweep. Postgres CONCURRENTLY
+      //    avoids the SHARE lock on `pages`; PGLite has no concurrent writers.
+      if (engine.kind === 'postgres') {
+        // Pre-drop any invalid index from a prior CONCURRENTLY failure (matches v14 pattern).
+        await engine.runMigration(34, `
+          DO $$ BEGIN
+            IF EXISTS (
+              SELECT 1 FROM pg_index i
+              JOIN pg_class c ON c.oid = i.indexrelid
+              WHERE c.relname = 'pages_deleted_at_purge_idx' AND NOT i.indisvalid
+            ) THEN
+              EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS pages_deleted_at_purge_idx';
+            END IF;
+          END $$;
+        `);
+        await engine.runMigration(34, `
+          CREATE INDEX CONCURRENTLY IF NOT EXISTS pages_deleted_at_purge_idx
+            ON pages (deleted_at) WHERE deleted_at IS NOT NULL;
+        `);
+      } else {
+        await engine.runMigration(34, `
+          CREATE INDEX IF NOT EXISTS pages_deleted_at_purge_idx
+            ON pages (deleted_at) WHERE deleted_at IS NOT NULL;
+        `);
+      }
+    },
+    // CONCURRENTLY on Postgres requires no surrounding transaction. PGLite ignores
+    // this flag, so the index DDL runs in whatever wrapper applies.
+    transaction: false,
+  },
+  {
+    version: 35,
+    name: 'auto_rls_event_trigger',
+    sql: '', // engine-specific via sqlFor
+    // v0.26.7 — Postgres event trigger that auto-enables RLS on every new public.*
+    // table, plus one-time backfill on every existing public.* table without it.
+    //
+    // Problem: tables created outside gbrain migrations (Baku's face_detections,
+    // manual SQL, other apps sharing the Supabase project) shipped without RLS.
+    // doctor caught them after the fact; the gap window between create and next
+    // doctor run was the silent vector.
+    //
+    // Fix has two halves:
+    //   1. Event trigger — fires on ddl_command_end for CREATE TABLE,
+    //      CREATE TABLE AS, and SELECT INTO; runs ALTER TABLE ... ENABLE ROW
+    //      LEVEL SECURITY for any new public.* table. Supabase-recommended
+    //      approach (no dashboard toggle exists).
+    //   2. One-time backfill — every existing public.* table whose RLS is off
+    //      and whose comment does NOT match the GBRAIN:RLS_EXEMPT contract
+    //      (same regex doctor.ts uses) gets RLS enabled.
+    //
+    // Posture choices (vs PR-as-shipped):
+    //   - ENABLE only, no FORCE — matches v24/v29/schema.sql. FORCE would lock
+    //     out non-BYPASSRLS apps from their own newly-created tables (the
+    //     trigger function inherits the caller's role, and the new table is
+    //     owned by that role). gbrain has BYPASSRLS so gbrain itself is unaffected.
+    //   - public-only schema scope — Supabase manages auth/storage/realtime/etc.
+    //     and runs its own RLS posture there; we must not disturb those schemas.
+    //   - No EXCEPTION wrap inside the trigger — ddl_command_end fires inside
+    //     the DDL transaction, so a failed ALTER aborts the offending CREATE
+    //     TABLE. That's a loud signal, not a silent gap. Wrapping would CREATE
+    //     the silent path this migration exists to close.
+    //   - No privilege pre-check — runMigrations rethrows on SQL failure and
+    //     gates config.version, so a non-superuser run already fails loud with
+    //     an actionable Postgres error.
+    //
+    // BREAKING CHANGE: the backfill is a one-time override of intentionally
+    // RLS-off public tables that don't carry the GBRAIN:RLS_EXEMPT comment.
+    // Operators with such tables MUST add the exempt comment BEFORE upgrading.
+    //
+    // PGLite: no-op — no RLS engine, no event triggers, single-tenant by design.
+    sqlFor: {
+      postgres: `
+        -- Trigger function: fires post-DDL inside the CREATE TABLE transaction.
+        -- A failure here aborts the CREATE TABLE so no public.* table is ever
+        -- created without RLS. object_identity is pre-quoted by Postgres
+        -- (e.g. "public"."My Table"), so %s is correct — %I would double-quote.
+        CREATE OR REPLACE FUNCTION auto_enable_rls()
+        RETURNS event_trigger AS $$
+        DECLARE
+          obj record;
+        BEGIN
+          FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
+            WHERE object_type = 'table'
+            AND schema_name = 'public'
+          LOOP
+            EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', obj.object_identity);
+          END LOOP;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        -- WHEN TAG covers all three table-creation syntaxes Postgres reports.
+        -- CREATE TABLE / CREATE TABLE AS / SELECT INTO produce distinct command
+        -- tags; covering only 'CREATE TABLE' would leave a syntax-shaped hole.
+        DROP EVENT TRIGGER IF EXISTS auto_rls_on_create_table;
+        CREATE EVENT TRIGGER auto_rls_on_create_table
+          ON ddl_command_end
+          WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO')
+          EXECUTE FUNCTION auto_enable_rls();
+
+        -- One-time backfill of every existing public.* base table without RLS.
+        -- Honors the same GBRAIN:RLS_EXEMPT regex doctor.ts uses
+        -- (^GBRAIN:RLS_EXEMPT\\s+reason=\\S.{3,}) so the two surfaces stay aligned.
+        -- %I.%I quotes the schema and table names safely, including mixed-case.
+        DO $$
+        DECLARE
+          has_bypass BOOLEAN;
+          r record;
+        BEGIN
+          SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+          IF NOT has_bypass THEN
+            -- Same posture as v24: raise to abort the migration so the runner
+            -- leaves config.version unbumped and retries on the next call.
+            RAISE EXCEPTION 'v35 auto_rls_event_trigger backfill: role % does not have BYPASSRLS — cannot enable RLS safely. Re-run as postgres (or another BYPASSRLS role).', current_user;
+          END IF;
+
+          FOR r IN
+            SELECT n.nspname AS schema_name, c.relname AS table_name
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN pg_description d ON d.objoid = c.oid AND d.objsubid = 0
+            WHERE n.nspname = 'public'
+              AND c.relkind = 'r'
+              AND c.relrowsecurity = false
+              AND (d.description IS NULL OR d.description !~ '^GBRAIN:RLS_EXEMPT\\s+reason=\\S.{3,}')
+          LOOP
+            EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', r.schema_name, r.table_name);
+            RAISE NOTICE 'v35: backfilled RLS on %.%', r.schema_name, r.table_name;
+          END LOOP;
+        END $$;
+      `,
+      pglite: '', // PGLite has no RLS and no event trigger support
+    },
+  },
+  {
+    version: 36,
+    name: 'subagent_provider_neutral_persistence_v0_27',
+    // v0.27 multi-provider subagent. Codex F-OV-1 / D11: the subagent_messages
+    // and subagent_tool_executions tables stored Anthropic-shaped tool_use /
+    // tool_result blocks as JSONB. When a worker resumes a job mid-loop and
+    // the live model is OpenAI/DeepSeek/etc, the persisted shape becomes the
+    // runtime contract — translation at read time is lossy.
+    //
+    // Fix: add schema_version + provider_id columns. schema_version=1 is the
+    // legacy Anthropic-shape (existing rows). schema_version=2 is the
+    // provider-neutral ChatBlock format documented in src/core/ai/gateway.ts
+    // (text / tool-call / tool-result blocks with normalized field names).
+    // Subagent.ts (commit 2) writes schema_version=2 going forward and reads
+    // both shapes via a versioned mapper.
+    //
+    // Renumbered v34→v35→v36 across master merges: master's v34
+    // (destructive_guard_columns, v0.26.5 soft-delete) and v35
+    // (auto_rls_event_trigger, v0.26.8) landed first.
+    //
+    // No data migration. Existing in-flight jobs continue to replay against
+    // their original shape; new jobs use v2. ADD COLUMN IF NOT EXISTS makes
+    // the migration idempotent.
+    sql: `
+      ALTER TABLE subagent_messages
+        ADD COLUMN IF NOT EXISTS schema_version INTEGER NOT NULL DEFAULT 1,
+        ADD COLUMN IF NOT EXISTS provider_id TEXT;
+
+      ALTER TABLE subagent_tool_executions
+        ADD COLUMN IF NOT EXISTS schema_version INTEGER NOT NULL DEFAULT 1,
+        ADD COLUMN IF NOT EXISTS provider_id TEXT;
+
+      -- Lookup by provider for cost rollups + per-provider replay diagnostics.
+      CREATE INDEX IF NOT EXISTS idx_subagent_messages_provider
+        ON subagent_messages (job_id, provider_id);
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
@@ -1374,6 +1840,32 @@ async function runMigrationSQL(
       }
       await conn.executeRaw(sql);
     });
+  }
+}
+
+/**
+ * Cheap probe: does this engine have schema migrations pending?
+ *
+ * Reads the `version` config row in a single round-trip (no schema replay,
+ * no migration apply). Used by `connectEngine` to gate `initSchema()` so
+ * short-lived CLI invocations on already-migrated brains don't pay the
+ * full bootstrap-probe + SCHEMA_SQL replay + ledger-check cost on every
+ * `gbrain stats` / `gbrain query` / `gbrain doctor`.
+ *
+ * Defensive: treats a getConfig failure (config table missing, query error)
+ * as "yes pending" so the caller falls through to the full initSchema path.
+ * Worst case on a wedged brain is one extra schema replay — same as before.
+ *
+ * Closes #651 in cooperation with the post-upgrade auto-apply hook (X1)
+ * without the perf cost #652 would have introduced on every CLI call.
+ */
+export async function hasPendingMigrations(engine: BrainEngine): Promise<boolean> {
+  try {
+    const currentStr = await engine.getConfig('version');
+    const current = parseInt(currentStr || '1', 10);
+    return current < LATEST_VERSION;
+  } catch {
+    return true;
   }
 }
 

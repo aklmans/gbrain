@@ -1,13 +1,13 @@
 /**
- * E2E full 8-phase cycle on PGLite, no API key required.
+ * E2E full 9-phase cycle on PGLite, no API key required.
  *
  * Verifies that the v0.23 phase order — lint → backlinks → sync →
- * synthesize → extract → patterns → embed → orphans — is honored
+ * synthesize → extract → patterns → embed → orphans → purge — is honored
  * end-to-end through runCycle when no API key is present (synthesize
- * + patterns skip cleanly, the other six phases run unchanged).
+ * + patterns skip cleanly, purge skips cleanly on dry-run).
  *
  * Two regression-relevant invariants:
- *   1. CycleReport.phases preserves the 8-phase order — no future
+ *   1. CycleReport.phases preserves the phase order — no future
  *      reorder regresses without breaking this test.
  *   2. CycleReport.totals carries the new v0.23 fields:
  *      transcripts_processed, synth_pages_written, patterns_written.
@@ -35,6 +35,18 @@ mock.module('../../src/core/embedding.ts', () => ({
 }));
 
 const { runCycle, ALL_PHASES } = await import('../../src/core/cycle.ts');
+
+const EXPECTED_PHASES: typeof ALL_PHASES = [
+  'lint',
+  'backlinks',
+  'sync',
+  'synthesize',
+  'extract',
+  'patterns',
+  'embed',
+  'orphans',
+  'purge',
+];
 
 interface TestRig {
   engine: PGLiteEngine;
@@ -80,21 +92,12 @@ async function withoutAnthropicKey<T>(body: () => Promise<T>): Promise<T> {
   }
 }
 
-describe('E2E v0.23 8-phase cycle', () => {
-  test('ALL_PHASES is the 8-phase order in the documented sequence', () => {
-    expect(ALL_PHASES).toEqual([
-      'lint',
-      'backlinks',
-      'sync',
-      'synthesize',
-      'extract',
-      'patterns',
-      'embed',
-      'orphans',
-    ]);
+describe('E2E v0.23+ cycle', () => {
+  test('ALL_PHASES is the documented sequence', () => {
+    expect(ALL_PHASES).toEqual(EXPECTED_PHASES);
   });
 
-  test('full cycle on dry-run returns CycleReport.phases in v0.23 order with new totals fields', async () => {
+  test('full cycle on dry-run returns CycleReport.phases in documented order with new totals fields', async () => {
     const rig = await setupRig();
     try {
       await withoutAnthropicKey(async () => {
@@ -104,21 +107,14 @@ describe('E2E v0.23 8-phase cycle', () => {
         });
         // Phase ordering preserved
         const phaseNames = report.phases.map(p => p.phase);
-        expect(phaseNames).toEqual([
-          'lint',
-          'backlinks',
-          'sync',
-          'synthesize',
-          'extract',
-          'patterns',
-          'embed',
-          'orphans',
-        ]);
+        expect(phaseNames).toEqual(EXPECTED_PHASES);
         // New totals fields exist (v0.23 additive growth)
         expect(report.totals).toMatchObject({
           transcripts_processed: 0,
           synth_pages_written: 0,
           patterns_written: 0,
+          purged_sources_count: 0,
+          purged_pages_count: 0,
         });
         // Synthesize and patterns are skipped (not_configured / insufficient_evidence)
         const synth = report.phases.find(p => p.phase === 'synthesize');

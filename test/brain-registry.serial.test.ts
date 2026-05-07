@@ -13,6 +13,7 @@ import {
   type MountEntry,
 } from '../src/core/brain-registry.ts';
 import { GBrainError } from '../src/core/types.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 /** Create a temp dir + write a mounts.json into it. Returns the path. */
 function tempMountsFile(contents: unknown): string {
@@ -270,12 +271,15 @@ describe('BrainRegistry — lazy init', () => {
     // verify the routing logic by observing the default-branch path. This
     // test proves the fall-through to HOST_BRAIN_ID happens before any
     // lookup, not that host init actually succeeds.
-    const reg = new BrainRegistry([]);
-    // Expect the host-init path to be attempted (it'll fail on missing
-    // ~/.gbrain/config.json in test env, but the error will come from
-    // initHostBrain, not UnknownBrainError — proving routing hit host).
-    await expect(reg.getBrain(null)).rejects.not.toBeInstanceOf(UnknownBrainError);
-    await expect(reg.getBrain(undefined)).rejects.not.toBeInstanceOf(UnknownBrainError);
-    await expect(reg.getBrain('')).rejects.not.toBeInstanceOf(UnknownBrainError);
+    const home = track(mkdtempSync(join(tmpdir(), 'brain-registry-home-')));
+    await withEnv({ GBRAIN_HOME: home, GBRAIN_DATABASE_URL: undefined, DATABASE_URL: undefined }, async () => {
+      const reg = new BrainRegistry([]);
+      // Expect the host-init path to be attempted (it'll fail on missing
+      // config in the isolated test home, but the error will come from
+      // initHostBrain, not UnknownBrainError — proving routing hit host).
+      await expect(reg.getBrain(null)).rejects.not.toBeInstanceOf(UnknownBrainError);
+      await expect(reg.getBrain(undefined)).rejects.not.toBeInstanceOf(UnknownBrainError);
+      await expect(reg.getBrain('')).rejects.not.toBeInstanceOf(UnknownBrainError);
+    });
   });
 });

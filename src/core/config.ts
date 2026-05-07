@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'f
 import { join } from 'path';
 import { homedir } from 'os';
 import type { EngineConfig } from './types.ts';
+import { getLegacyGatewayEnvConfig } from './provider-config.ts';
 
 /**
  * Where is the active DB URL coming from? Pure introspection, no connection
@@ -31,6 +32,23 @@ export interface GBrainConfig {
   database_path?: string;
   openai_api_key?: string;
   anthropic_api_key?: string;
+  /** AI gateway config (v0.14+). Default: "openai:text-embedding-3-large" / 1536 / "anthropic:claude-haiku-4-5-20251001". */
+  embedding_model?: string;
+  embedding_dimensions?: number;
+  expansion_model?: string;
+  /**
+   * Default chat model for `gateway.chat()` callers (v0.27+).
+   * Default: "anthropic:claude-sonnet-4-6-20250929".
+   */
+  chat_model?: string;
+  /**
+   * Optional silent-refusal fallback chain for `chatWithFallback()` (v0.27+).
+   * Each entry is a "provider:modelId" string. Blocked from critic/judge/
+   * synthesize flows in their respective handlers (per D13 review decision).
+   */
+  chat_fallback_chain?: string[];
+  /** Optional base URL overrides for openai-compatible providers (keyed by recipe id). */
+  provider_base_urls?: Record<string, string>;
   /**
    * Optional storage backend config (S3/Supabase/local). Shape matches
    * `StorageConfig` in `./storage.ts`. Typed as `unknown` here to avoid
@@ -71,13 +89,27 @@ export function loadConfig(): GBrainConfig | null {
   // Infer engine type if not explicitly set
   const inferredEngine: 'postgres' | 'pglite' = fileConfig?.engine
     || (fileConfig?.database_path ? 'pglite' : 'postgres');
+  const legacyGatewayConfig = getLegacyGatewayEnvConfig();
+  const providerBaseUrls = {
+    ...(fileConfig?.provider_base_urls ?? {}),
+    ...(legacyGatewayConfig.provider_base_urls ?? {}),
+  };
 
-  // Merge: env vars override config file
+  // Merge: env vars override config file. READ only — never mutate process.env.
   const merged = {
     ...fileConfig,
     engine: inferredEngine,
     ...(dbUrl ? { database_url: dbUrl } : {}),
     ...(process.env.OPENAI_API_KEY ? { openai_api_key: process.env.OPENAI_API_KEY } : {}),
+    ...legacyGatewayConfig,
+    ...(process.env.GBRAIN_EMBEDDING_MODEL ? { embedding_model: process.env.GBRAIN_EMBEDDING_MODEL } : {}),
+    ...(process.env.GBRAIN_EMBEDDING_DIMENSIONS ? { embedding_dimensions: parseInt(process.env.GBRAIN_EMBEDDING_DIMENSIONS, 10) } : {}),
+    ...(process.env.GBRAIN_EXPANSION_MODEL ? { expansion_model: process.env.GBRAIN_EXPANSION_MODEL } : {}),
+    ...(process.env.GBRAIN_CHAT_MODEL ? { chat_model: process.env.GBRAIN_CHAT_MODEL } : {}),
+    ...(Object.keys(providerBaseUrls).length > 0 ? { provider_base_urls: providerBaseUrls } : {}),
+    ...(process.env.GBRAIN_CHAT_FALLBACK_CHAIN
+      ? { chat_fallback_chain: process.env.GBRAIN_CHAT_FALLBACK_CHAIN.split(',').map(s => s.trim()).filter(Boolean) }
+      : {}),
   };
   return merged as GBrainConfig;
 }

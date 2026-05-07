@@ -22,14 +22,15 @@ import type {
 import type { OAuthServerProvider, AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
-import { hashToken, generateToken } from './utils.ts';
+import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
+import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 /** Raw SQL query function — works with both PGLite and postgres tagged templates */
-type SqlQuery = (strings: TemplateStringsArray, ...values: unknown[]) => Promise<Record<string, unknown>[]>;
+export type SqlQuery = (strings: TemplateStringsArray, ...values: unknown[]) => Promise<Record<string, unknown>[]>;
 
 /**
  * Convert a JS array to a PostgreSQL array literal for PGLite compat.
@@ -77,12 +78,50 @@ function validateRedirectUri(uri: string): void {
   );
 }
 
+/**
+ * Coerce an OAuth timestamp column (Unix epoch seconds, BIGINT) into a JS
+ * number, or undefined for SQL NULL.
+ *
+ * Why this exists: postgres.js with `prepare: false` (the auto-detected setting
+ * on Supabase PgBouncer / port 6543; see src/core/db.ts:resolvePrepare) returns
+ * BIGINT columns as strings. Two surfaces break on that: (1) the MCP SDK's
+ * bearerAuth middleware checks `typeof authInfo.expiresAt === 'number'` and
+ * rejects strings; (2) RFC 7591 §3.2.1 requires `client_id_issued_at` and
+ * `client_secret_expires_at` to be JSON numbers in DCR responses, not strings.
+ *
+ * Throws on non-finite (NaN/Infinity) so corrupt rows fail loud at the boundary
+ * instead of letting `expiresAt: NaN` flow through to the SDK as a fake-valid
+ * token. Returns undefined for SQL NULL so callers decide NULL semantics
+ * explicitly. For OAuth, the comparison sites treat NULL as "expired"
+ * (fail-closed); the DCR response sites preserve undefined per RFC 7591
+ * (the `client_secret_expires_at` field is optional, undefined means
+ * "did not expire").
+ */
+export function coerceTimestamp(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    throw new Error(`coerceTimestamp: non-finite timestamp value ${JSON.stringify(value)}`);
+  }
+  return n;
+}
+
 interface GBrainOAuthProviderOptions {
   sql: SqlQuery;
   /** Default token TTL in seconds (default: 3600 = 1 hour) */
   tokenTtl?: number;
   /** Default refresh token TTL in seconds (default: 30 days) */
   refreshTtl?: number;
+  /**
+   * Disable Dynamic Client Registration (RFC 7591) while keeping the rest of
+   * the OAuth surface intact. When true, `clientsStore.registerClient` is not
+   * surfaced to the SDK router, so POST `/register` returns 404 even though
+   * the underlying provider can still register clients programmatically via
+   * `registerClientManual`. Replaces the previous monkey-patching pattern in
+   * serve-http.ts (cleanup, not a security fix — DCR was never reachable
+   * before mcpAuthRouter ran).
+   */
+  dcrDisabled?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -109,8 +148,8 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
       grant_types: (r.grant_types as string[]) || ['client_credentials'],
       scope: r.scope as string | undefined,
       token_endpoint_auth_method: r.token_endpoint_auth_method as string | undefined,
-      client_id_issued_at: r.client_id_issued_at as number | undefined,
-      client_secret_expires_at: r.client_secret_expires_at as number | undefined,
+      client_id_issued_at: coerceTimestamp(r.client_id_issued_at),
+      client_secret_expires_at: coerceTimestamp(r.client_secret_expires_at),
     };
   }
 
@@ -124,6 +163,12 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
     for (const uri of client.redirect_uris || []) {
       validateRedirectUri(String(uri));
     }
+
+    // v0.28: ALLOWED_SCOPES allowlist. RFC 6749 §5.2 invalid_scope. The DCR
+    // path is reachable by any unauthenticated network caller when --enable-dcr
+    // is on, so this is the security-relevant gate (manual CLI registration
+    // is operator-trusted).
+    assertAllowedScopes(parseScopeString(client.scope));
 
     const clientId = generateToken('gbrain_cl_');
     const clientSecret = generateToken('gbrain_cs_');
@@ -157,17 +202,29 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
 export class GBrainOAuthProvider implements OAuthServerProvider {
   private sql: SqlQuery;
   private _clientsStore: GBrainClientsStore;
+  private readonly dcrDisabled: boolean;
   private tokenTtl: number;
   private refreshTtl: number;
 
   constructor(options: GBrainOAuthProviderOptions) {
     this.sql = options.sql;
     this._clientsStore = new GBrainClientsStore(this.sql);
+    this.dcrDisabled = options.dcrDisabled === true;
     this.tokenTtl = options.tokenTtl || 3600;
     this.refreshTtl = options.refreshTtl || 30 * 24 * 3600;
   }
 
   get clientsStore(): OAuthRegisteredClientsStore {
+    if (this.dcrDisabled) {
+      // Surface getClient only — without registerClient the SDK's mcpAuthRouter
+      // does not wire up the /register DCR endpoint. Replaces the prior
+      // monkey-patch in serve-http.ts; the outcome is identical (DCR off-by-
+      // default), but the API expresses intent on the constructor instead of
+      // requiring callers to mutate `_clientsStore` after construction.
+      return {
+        getClient: this._clientsStore.getClient.bind(this._clientsStore),
+      } as OAuthRegisteredClientsStore;
+    }
     return this._clientsStore;
   }
 
@@ -202,13 +259,18 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
   }
 
   async challengeForAuthorizationCode(
-    _client: OAuthClientInformationFull,
+    client: OAuthClientInformationFull,
     authorizationCode: string,
   ): Promise<string> {
     const codeHash = hashToken(authorizationCode);
+    // F1 hardening: bind client_id atomically so a wrong client cannot read
+    // another client's PKCE challenge. Pre-fix the SELECT didn't filter on
+    // client_id at all.
     const rows = await this.sql`
       SELECT code_challenge FROM oauth_codes
-      WHERE code_hash = ${codeHash} AND expires_at > ${Math.floor(Date.now() / 1000)}
+      WHERE code_hash = ${codeHash}
+        AND client_id = ${client.client_id}
+        AND expires_at > ${Math.floor(Date.now() / 1000)}
     `;
     if (rows.length === 0) throw new Error('Authorization code not found or expired');
     return rows[0].code_challenge as string;
@@ -218,27 +280,44 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     client: OAuthClientInformationFull,
     authorizationCode: string,
     _codeVerifier?: string,
-    _redirectUri?: string,
+    redirectUri?: string,
     resource?: URL,
   ): Promise<OAuthTokens> {
     const codeHash = hashToken(authorizationCode);
     const now = Math.floor(Date.now() / 1000);
 
-    // Atomic single-use: DELETE...RETURNING in one statement closes the
-    // TOCTOU window. RFC 6749 §10.5 requires auth codes be single-use; the
-    // earlier SELECT-then-DELETE pattern let two concurrent token requests
-    // both pass the SELECT before either ran the DELETE, issuing two valid
-    // token pairs from one code. With RETURNING, the second request gets
-    // zero rows back and fails cleanly. See CSO finding #2.
-    const rows = await this.sql`
-      DELETE FROM oauth_codes
-      WHERE code_hash = ${codeHash} AND expires_at > ${now}
-      RETURNING client_id, scopes, resource
-    `;
+    // F1 + F7c hardening: bind client_id AND redirect_uri atomically into the
+    // DELETE WHERE clause. RFC 6749 §10.5 requires auth codes be single-use;
+    // RFC 6749 §4.1.3 requires the token endpoint validate redirect_uri
+    // matches the value sent at /authorize. The previous SELECT-then-compare
+    // pattern (a) burned the code on the wrong-client path so the legitimate
+    // client could not retry, and (b) ignored redirect_uri on exchange
+    // entirely. With RETURNING, the second request — or any wrong-client /
+    // wrong-redirect-uri attempt — gets zero rows back and fails cleanly.
+    // The legitimate client's code stays available for one valid redemption.
+    //
+    // Use `redirectUri !== undefined` rather than truthy — an attacker
+    // submitting `redirect_uri=""` (empty string) at /token would otherwise
+    // hit the falsy branch and bypass the binding entirely.
+    const rows = redirectUri !== undefined
+      ? await this.sql`
+          DELETE FROM oauth_codes
+          WHERE code_hash = ${codeHash}
+            AND client_id = ${client.client_id}
+            AND redirect_uri = ${redirectUri}
+            AND expires_at > ${now}
+          RETURNING client_id, scopes, resource
+        `
+      : await this.sql`
+          DELETE FROM oauth_codes
+          WHERE code_hash = ${codeHash}
+            AND client_id = ${client.client_id}
+            AND expires_at > ${now}
+          RETURNING client_id, scopes, resource
+        `;
     if (rows.length === 0) throw new Error('Authorization code not found or expired');
 
     const codeRow = rows[0];
-    if (codeRow.client_id !== client.client_id) throw new Error('Client mismatch');
 
     // Issue tokens
     const scopes = (codeRow.scopes as string[]) || [];
@@ -258,22 +337,48 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const tokenHash = hashToken(refreshToken);
     const now = Math.floor(Date.now() / 1000);
 
-    // Atomic rotation: DELETE...RETURNING closes the TOCTOU window. RFC 6749
-    // §10.4 detection of stolen refresh tokens depends on second-use failure;
-    // the earlier SELECT-then-DELETE pattern let attacker + victim both
-    // succeed, defeating that signal. See CSO finding #3.
+    // F2 hardening: bind client_id atomically into the DELETE WHERE clause.
+    // RFC 6749 §10.4 detection of stolen refresh tokens depends on second-use
+    // failure. The previous SELECT-then-DELETE pattern + post-hoc client
+    // compare let an attacker who guessed/stole a refresh token burn it on
+    // the wrong-client path, defeating the stolen-token signal for the
+    // legitimate client. With the predicate in the DELETE, wrong-client
+    // attempts get zero rows back; the legitimate client retains the row
+    // for one valid rotation.
     const rows = await this.sql`
       DELETE FROM oauth_tokens
-      WHERE token_hash = ${tokenHash} AND token_type = 'refresh'
+      WHERE token_hash = ${tokenHash}
+        AND token_type = 'refresh'
+        AND client_id = ${client.client_id}
       RETURNING client_id, scopes, expires_at
     `;
     if (rows.length === 0) throw new Error('Refresh token not found');
 
     const row = rows[0];
-    if (row.client_id !== client.client_id) throw new Error('Client mismatch');
-    if ((row.expires_at as number) < now) throw new Error('Refresh token expired');
+    // NULL expires_at is treated as expired (fail-closed). Schema permits NULL
+    // even though issueTokens always sets it, so a corrupt or hand-modified row
+    // can't ride past validation.
+    const expiresAt = coerceTimestamp(row.expires_at);
+    if (expiresAt === undefined || expiresAt < now) throw new Error('Refresh token expired');
 
-    const tokenScopes = scopes || (row.scopes as string[]) || [];
+    // F3 hardening: requested scopes on refresh MUST be a subset of the
+    // original grant on this refresh token's row. RFC 6749 §6: "the scope of
+    // the access token … MUST NOT include any scope not originally granted by
+    // the resource owner." Scope is checked against the row's scopes (the
+    // grant), NOT against the client's currently-allowed scopes (which can
+    // expand later). Omitted scope (`undefined`) inherits the original grant
+    // verbatim and stays distinct from an explicit empty array.
+    //
+    // v0.28: hasScope replaces exact-string-match so an `admin` grant CAN
+    // refresh down to `sources_admin` (admin implies all). Without this,
+    // gstack /setup-gbrain Path 4 — which mints a sources_admin-scoped
+    // refresh — would fail when the brain admin's bootstrap token was
+    // issued at the `admin` tier.
+    const grantedScopes = (row.scopes as string[]) || [];
+    if (scopes && scopes.some(s => !hasScope(grantedScopes, s))) {
+      throw new Error('Requested scope exceeds refresh token grant');
+    }
+    const tokenScopes = scopes ?? grantedScopes;
     return this.issueTokens(client.client_id, tokenScopes, resource, true);
   }
 
@@ -285,24 +390,34 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const tokenHash = hashToken(token);
     const now = Math.floor(Date.now() / 1000);
 
-    // Try OAuth tokens first
+    // Try OAuth tokens first. JOIN oauth_clients in the same query so
+    // verifyAccessToken returns client_name in AuthInfo — eliminates the
+    // separate per-request lookup at serve-http.ts that was the N+1 hot
+    // path (see PR #586 review D14=B).
     const oauthRows = await this.sql`
-      SELECT client_id, scopes, expires_at, resource FROM oauth_tokens
-      WHERE token_hash = ${tokenHash} AND token_type = 'access'
+      SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name
+      FROM oauth_tokens t
+      LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+      WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
     `;
 
     if (oauthRows.length > 0) {
       const row = oauthRows[0];
-      if ((row.expires_at as number) < now) {
+      // NULL expires_at is treated as expired (fail-closed). Schema permits NULL,
+      // and the SDK's bearerAuth requires `typeof expiresAt === 'number'` — we
+      // throw here rather than return an undefined-bearing AuthInfo.
+      const expiresAt = coerceTimestamp(row.expires_at);
+      if (expiresAt === undefined || expiresAt < now) {
         throw new Error('Token expired');
       }
       return {
         token,
         clientId: row.client_id as string,
+        clientName: (row.client_name as string | null) ?? undefined,
         scopes: (row.scopes as string[]) || [],
-        expiresAt: Number(row.expires_at),
+        expiresAt,
         resource: row.resource ? new URL(row.resource as string) : undefined,
-      };
+      } as AuthInfo;
     }
 
     // Fallback: legacy access_tokens table (backward compat)
@@ -312,16 +427,20 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     `;
 
     if (legacyRows.length > 0) {
-      // Legacy tokens get full admin access (grandfather in)
+      // Legacy tokens get full admin access (grandfather in).
+      // For legacy tokens, name = clientId = clientName (single identifier).
       // Update last_used_at
       await this.sql`
         UPDATE access_tokens SET last_used_at = now() WHERE token_hash = ${tokenHash}
       `;
+      const name = legacyRows[0].name as string;
       return {
         token,
-        clientId: legacyRows[0].name as string,
+        clientId: name,
+        clientName: name,
         scopes: ['read', 'write', 'admin'],
-      };
+        expiresAt: Math.floor(Date.now() / 1000) + 365 * 24 * 3600, // Legacy tokens never expire — set 1yr future
+      } as AuthInfo;
     }
 
     throw new Error('Invalid token');
@@ -332,11 +451,21 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
   // -------------------------------------------------------------------------
 
   async revokeToken(
-    _client: OAuthClientInformationFull,
+    client: OAuthClientInformationFull,
     request: OAuthTokenRevocationRequest,
   ): Promise<void> {
     const tokenHash = hashToken(request.token);
-    await this.sql`DELETE FROM oauth_tokens WHERE token_hash = ${tokenHash}`;
+    // F4 hardening: bind client_id so a client can only revoke its own
+    // tokens. RFC 7009 §2.1: "The authorization server first validates the
+    // client credentials … and then verifies whether the token was issued
+    // to the client making the revocation request." Pre-fix, any
+    // authenticated client that knew (or guessed) another client's token
+    // hash could revoke it.
+    await this.sql`
+      DELETE FROM oauth_tokens
+      WHERE token_hash = ${tokenHash}
+        AND client_id = ${client.client_id}
+    `;
   }
 
   // -------------------------------------------------------------------------
@@ -351,6 +480,21 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const client = await this._clientsStore.getClient(clientId);
     if (!client) throw new Error('Client not found');
 
+    // Check if client has been revoked (soft-deleted). The deleted_at column
+    // is recent — pre-migration brains don't have it, so the probe must
+    // tolerate that one specific failure mode without swallowing real errors
+    // (lock timeouts, network blips, auth failures).
+    try {
+      const [revoked] = await this.sql`SELECT deleted_at FROM oauth_clients WHERE client_id = ${clientId} AND deleted_at IS NOT NULL`;
+      if (revoked) throw new Error('Client has been revoked');
+    } catch (e) {
+      // F5 hardening: surface anything that ISN'T a missing-column error.
+      // Bare `catch {}` masked DB outages as "client not revoked" — fail-open
+      // posture in a security-sensitive code path.
+      if (e instanceof Error && e.message === 'Client has been revoked') throw e;
+      if (!isUndefinedColumnError(e, 'deleted_at')) throw e;
+    }
+
     // Check grant type first (before verifying secret)
     const grants = (client.grant_types as string[]) || [];
     if (!grants.includes('client_credentials')) {
@@ -361,13 +505,29 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const secretHash = hashToken(clientSecret);
     if (client.client_secret !== secretHash) throw new Error('Invalid client secret');
 
-    // Determine scopes
-    const allowedScopes = (client.scope || '').split(' ').filter(Boolean);
-    const requestedScopes = requestedScope ? requestedScope.split(' ').filter(Boolean) : allowedScopes;
-    const grantedScopes = requestedScopes.filter(s => allowedScopes.includes(s));
+    // Determine scopes. v0.28 swaps exact-string-match for hasScope so a
+    // client whose grant is `admin` can mint tokens that include implied
+    // scopes like `sources_admin` (admin implies all). Tokens are still
+    // capped by what the client was registered for — this only changes how
+    // the cap is computed.
+    const allowedScopes = parseScopeString(client.scope);
+    const requestedScopes = requestedScope ? parseScopeString(requestedScope) : allowedScopes;
+    const grantedScopes = requestedScopes.filter(s => hasScope(allowedScopes, s));
+
+    // Per-client TTL override (stored in oauth_clients.token_ttl)
+    // Column may not exist on PGLite/older schemas — graceful fallback
+    let clientTtl: number | undefined;
+    try {
+      const ttlRows = await this.sql`SELECT token_ttl FROM oauth_clients WHERE client_id = ${clientId}`;
+      if (ttlRows.length > 0 && ttlRows[0].token_ttl) clientTtl = Number(ttlRows[0].token_ttl);
+    } catch (e) {
+      // F5 hardening: same posture as the deleted_at probe above. Only the
+      // "column doesn't exist" path is a non-fatal fall-through.
+      if (!isUndefinedColumnError(e, 'token_ttl')) throw e;
+    }
 
     // Client credentials: access token only, NO refresh token (RFC 6749 4.4.3)
-    return this.issueTokens(clientId, grantedScopes, undefined, false);
+    return this.issueTokens(clientId, grantedScopes, undefined, false, clientTtl);
   }
 
   // -------------------------------------------------------------------------
@@ -376,13 +536,17 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
 
   async sweepExpiredTokens(): Promise<number> {
     const now = Math.floor(Date.now() / 1000);
+    // F6 hardening: postgres.js and PGLite expose deleted-row count on
+    // different shapes; `(result as any).count` returned 0 on at least one
+    // engine even when rows were deleted, and codes were never counted at
+    // all. RETURNING 1 + array length is portable across both engines.
     const result = await this.sql`
-      DELETE FROM oauth_tokens WHERE expires_at < ${now}
+      DELETE FROM oauth_tokens WHERE expires_at < ${now} RETURNING 1
     `;
     const deletedCodes = await this.sql`
-      DELETE FROM oauth_codes WHERE expires_at < ${now}
+      DELETE FROM oauth_codes WHERE expires_at < ${now} RETURNING 1
     `;
-    return (result as any).count || 0;
+    return result.length + deletedCodes.length;
   }
 
   // -------------------------------------------------------------------------
@@ -395,6 +559,12 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     scopes: string,
     redirectUris: string[] = [],
   ): Promise<{ clientId: string; clientSecret: string }> {
+    // v0.28: ALLOWED_SCOPES allowlist. Reject `--scopes "read flying-unicorn"`
+    // at registration so meaningless scope strings can't pile up in the DB.
+    // Pre-allowlist clients keep working (allowlist is registration-time;
+    // existing rows aren't re-validated).
+    assertAllowedScopes(parseScopeString(scopes));
+
     const clientId = generateToken('gbrain_cl_');
     const clientSecret = generateToken('gbrain_cs_');
     const secretHash = hashToken(clientSecret);
@@ -419,11 +589,13 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     scopes: string[],
     resource: URL | undefined,
     includeRefresh: boolean,
+    ttlOverride?: number,
   ): Promise<OAuthTokens> {
     const accessToken = generateToken('gbrain_at_');
     const accessHash = hashToken(accessToken);
     const now = Math.floor(Date.now() / 1000);
-    const accessExpiry = now + this.tokenTtl;
+    const effectiveTtl = ttlOverride || this.tokenTtl;
+    const accessExpiry = now + effectiveTtl;
 
     await this.sql`
       INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
@@ -434,7 +606,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const result: OAuthTokens = {
       access_token: accessToken,
       token_type: 'bearer',
-      expires_in: this.tokenTtl,
+      expires_in: effectiveTtl,
       scope: scopes.join(' '),
     };
 

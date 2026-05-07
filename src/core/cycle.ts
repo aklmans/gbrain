@@ -52,7 +52,7 @@ import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 
 // ─── Types ─────────────────────────────────────────────────────────
 
-export type CyclePhase = 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract' | 'patterns' | 'embed' | 'orphans';
+export type CyclePhase = 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract' | 'patterns' | 'embed' | 'orphans' | 'purge';
 
 export const ALL_PHASES: CyclePhase[] = [
   'lint',
@@ -63,13 +63,18 @@ export const ALL_PHASES: CyclePhase[] = [
   'patterns',
   'embed',
   'orphans',
+  // v0.26.5: hard-deletes soft-deleted pages and expired archived sources past
+  // the 72h recovery window. Runs last so the rest of the cycle sees the
+  // recoverable set; the purge then drops what's expired.
+  'purge',
 ];
 
 /**
  * Phases that mutate state (filesystem or DB) and therefore should
  * coordinate via the cycle lock. Only orphans is truly read-only
  * and skips the lock. patterns mutates DB (writes pattern pages) so
- * it acquires the lock; synthesize too.
+ * it acquires the lock; synthesize too. v0.26.5 adds purge (DELETE-cascade
+ * across pages and sources).
  */
 const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'lint',
@@ -79,6 +84,7 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'extract',
   'patterns',
   'embed',
+  'purge',
 ]);
 
 export type PhaseStatus = 'ok' | 'warn' | 'fail' | 'skipped';
@@ -138,6 +144,10 @@ export interface CycleReport {
     synth_pages_written: number;
     /** v0.23: number of pattern pages written/updated by patterns phase. */
     patterns_written: number;
+    /** v0.26.5: number of source rows hard-deleted by the purge phase. */
+    purged_sources_count: number;
+    /** v0.26.5: number of page rows hard-deleted by the purge phase. */
+    purged_pages_count: number;
   };
 }
 
@@ -657,6 +667,101 @@ async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean): Promise<Phas
   }
 }
 
+/**
+ * v0.26.5 — purge phase. Hard-deletes:
+ *  - source rows where `archived = true AND archive_expires_at <= now()`
+ *    (paired with the cascade FK to `pages`, this also drops the source's pages)
+ *  - page rows where `deleted_at` is older than 72h
+ *
+ * Cascade on `pages` covers `content_chunks`, `page_links`, `chunk_relations`.
+ * `dryRun` short-circuits — no DELETEs are issued.
+ *
+ * Mirrors the operator escape hatches: `gbrain sources purge` (no id) and
+ * `gbrain pages purge-deleted` both call the same library functions, so
+ * scripted purges and the autopilot phase converge on a single behavior.
+ */
+/**
+ * v0.28 P1: sweep $GBRAIN_HOME/clones/.tmp/ for entries older than the
+ * configured TTL. addSource / recloneIfMissing clone into temp first then
+ * rename atomically; if the process is SIGKILL'd between clone and rename,
+ * the temp dir orphans. Without this sweep, a brain server accumulates
+ * gigabytes over months. Mirrors the page/source soft-delete TTL pattern
+ * so behavior is uniform across the purge phase.
+ */
+async function purgeOrphanClones(staleHours: number): Promise<{ count: number; bytes: number; names: string[] }> {
+  const fs = await import('fs');
+  const cfg = await import('./config.ts');
+  const tmpRoot = cfg.gbrainPath('clones', '.tmp');
+  if (!fs.existsSync(tmpRoot)) return { count: 0, bytes: 0, names: [] };
+  const STALE_MS = staleHours * 3600 * 1000;
+  const now = Date.now();
+  const removed: string[] = [];
+  let bytes = 0;
+  for (const ent of fs.readdirSync(tmpRoot, { withFileTypes: true })) {
+    const full = `${tmpRoot}/${ent.name}`;
+    try {
+      const st = fs.lstatSync(full);
+      if (now - st.mtimeMs <= STALE_MS) continue;
+      // Approximate size via stat (rough — recursive walk would be slow on
+      // a stuck-clone with thousands of files; the bytes field is just
+      // operator-visible feedback, not load-bearing).
+      try { bytes += st.size; } catch { /* skip */ }
+      fs.rmSync(full, { recursive: true, force: true });
+      removed.push(ent.name);
+    } catch {
+      /* skip unreadable / racing-with-another-process */
+    }
+  }
+  return { count: removed.length, bytes, names: removed };
+}
+
+async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<PhaseResult> {
+  try {
+    if (dryRun) {
+      return {
+        phase: 'purge',
+        status: 'ok',
+        duration_ms: 0,
+        summary: 'dry-run: skipped purge sweep',
+        details: { dry_run: true, purged_sources_count: 0, purged_pages_count: 0, purged_orphan_clones_count: 0 },
+      };
+    }
+    const { purgeExpiredSources } = await import('./destructive-guard.ts');
+    const purgedSources = await purgeExpiredSources(engine);
+    const purgedPages = await engine.purgeDeletedPages(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
+    const purgedClones = await purgeOrphanClones(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
+    return {
+      phase: 'purge',
+      status: 'ok',
+      duration_ms: 0,
+      summary:
+        `purged ${purgedSources.length} source(s), ${purgedPages.count} page(s), and ` +
+        `${purgedClones.count} orphan clone temp dir(s) past the 72h recovery window`,
+      details: {
+        purged_sources_count: purgedSources.length,
+        purged_pages_count: purgedPages.count,
+        purged_orphan_clones_count: purgedClones.count,
+        purged_orphan_clone_names: purgedClones.names,
+        purged_sources: purgedSources,
+        purged_page_slugs: purgedPages.slugs,
+      },
+    };
+  } catch (e) {
+    return {
+      phase: 'purge',
+      status: 'fail',
+      duration_ms: 0,
+      summary: 'purge phase failed',
+      details: {},
+      error: makeErrorFromException(e),
+    };
+  }
+}
+
+/** v0.26.5: matches SOFT_DELETE_TTL_HOURS in destructive-guard.ts. Inlined here
+ *  to avoid a static import (purge phase is only loaded in the autopilot path). */
+const SOFT_DELETE_TTL_HOURS_FOR_PURGE = 72;
+
 async function runPhaseOrphans(engine: BrainEngine): Promise<PhaseResult> {
   try {
     const { findOrphans } = await import('../commands/orphans.ts');
@@ -931,6 +1036,30 @@ export async function runCycle(
       }
       await safeYield(opts.yieldBetweenPhases);
     }
+
+    // ── Phase 9: purge (v0.26.5) ────────────────────────────────
+    // Hard-delete soft-deleted pages and expired archived sources past the
+    // 72h recovery window. Runs last so the rest of the cycle sees the
+    // recoverable set; the purge then drops what's truly expired.
+    if (phases.includes('purge')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'purge',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.purge');
+        const { result, duration_ms } = await timePhase(() => runPhasePurge(engine, dryRun));
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
   } finally {
     if (lock) {
       try { await lock.release(); } catch { /* best-effort */ }
@@ -965,6 +1094,8 @@ function emptyTotals(): CycleReport['totals'] {
     transcripts_processed: 0,
     synth_pages_written: 0,
     patterns_written: 0,
+    purged_sources_count: 0,
+    purged_pages_count: 0,
   };
 }
 
@@ -992,6 +1123,9 @@ function extractTotals(phases: PhaseResult[]): CycleReport['totals'] {
       t.synth_pages_written = Number(p.details.pages_written ?? 0);
     } else if (p.phase === 'patterns' && p.details) {
       t.patterns_written = Number(p.details.patterns_written ?? 0);
+    } else if (p.phase === 'purge' && p.details) {
+      t.purged_sources_count = Number(p.details.purged_sources_count ?? 0);
+      t.purged_pages_count = Number(p.details.purged_pages_count ?? 0);
     }
   }
   return t;

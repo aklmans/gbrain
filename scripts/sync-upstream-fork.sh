@@ -22,7 +22,7 @@ KEEP_CONFLICT=0
 RETURN_TO_START=1
 CUSTOM_CHECK_CMD="${GBRAIN_SYNC_CHECK_CMD:-}"
 
-QUICK_CHECK_CMD="${GBRAIN_SYNC_QUICK_CHECK_CMD:-bun run typecheck && bun test test/provider-config.test.ts test/embedding-provider-config.test.ts test/query-expansion-provider-config.test.ts test/subagent-provider-config.test.ts test/transcription-provider-config.test.ts test/provider-gate-regression.test.ts --timeout=60000}"
+QUICK_CHECK_CMD="${GBRAIN_SYNC_QUICK_CHECK_CMD:-bun run typecheck && bun test test/provider-config.serial.test.ts test/embedding-provider-config.serial.test.ts test/query-expansion-provider-config.serial.test.ts test/subagent-provider-config.serial.test.ts test/transcription-provider-config.serial.test.ts test/provider-gate-regression.serial.test.ts --timeout=60000}"
 FULL_TEST_CMD="${GBRAIN_SYNC_FULL_TEST_CMD:-bun run test}"
 
 usage() {

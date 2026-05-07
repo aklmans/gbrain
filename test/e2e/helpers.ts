@@ -35,6 +35,9 @@ const FIXTURES_DIR = resolve(import.meta.dir, 'fixtures');
 let engine: PostgresEngine | null = null;
 
 const ALL_TABLES = [
+  // v0.28: takes + synthesis_evidence MUST come BEFORE pages because they FK pages.id
+  'synthesis_evidence',
+  'takes',
   'content_chunks',
   'links',
   'tags',
@@ -73,10 +76,17 @@ export async function setupDB(): Promise<PostgresEngine> {
   await db.connect({ database_url: DATABASE_URL });
   await db.initSchema();
 
-  // Truncate all data tables (preserves schema + extensions)
+  // Truncate all data tables (preserves schema + extensions).
+  // Some tables (e.g. v0.28 takes/synthesis_evidence) only exist after
+  // migrations run via engine.connect() below, so skip non-existent tables.
   const conn = db.getConnection();
   for (const table of ALL_TABLES) {
-    await conn.unsafe(`TRUNCATE ${table} CASCADE`);
+    try {
+      await conn.unsafe(`TRUNCATE ${table} CASCADE`);
+    } catch (e: unknown) {
+      const code = (e as { code?: string })?.code;
+      if (code !== '42P01') throw e; // 42P01 = undefined_table; ignore those
+    }
   }
 
   // Re-seed config (initSchema inserts default config rows)
@@ -87,6 +97,37 @@ export async function setupDB(): Promise<PostgresEngine> {
 
   engine = new PostgresEngine();
   await engine.connect({ database_url: DATABASE_URL });
+  // Apply MIGRATIONS via the engine path. db.initSchema above only runs the
+  // embedded SCHEMA_SQL baseline; migrations like v31 (takes) live in the
+  // MIGRATIONS array and only run when engine.initSchema() executes them.
+  // Idempotent: re-running migrations on an already-migrated DB is a no-op.
+  await engine.initSchema();
+
+  // `sources` is deliberately outside ALL_TABLES because deleting it before
+  // page/file truncation would cascade through the brain. Reset it after the
+  // schema is current so E2E files are hermetic across repeated runs: several
+  // tests mutate the default source's name/path/config directly.
+  await conn.unsafe(`DELETE FROM sources WHERE id != 'default'`);
+  await conn.unsafe(`
+    INSERT INTO sources (id, name, local_path, last_commit, last_sync_at, config, chunker_version, archived, archived_at, archive_expires_at)
+    VALUES ('default', 'default', NULL, NULL, NULL, '{"federated": true}'::jsonb, NULL, false, NULL, NULL)
+    ON CONFLICT (id) DO UPDATE SET
+      name = EXCLUDED.name,
+      local_path = EXCLUDED.local_path,
+      last_commit = EXCLUDED.last_commit,
+      last_sync_at = EXCLUDED.last_sync_at,
+      config = EXCLUDED.config,
+      chunker_version = EXCLUDED.chunker_version,
+      archived = EXCLUDED.archived,
+      archived_at = EXCLUDED.archived_at,
+      archive_expires_at = EXCLUDED.archive_expires_at
+  `);
+  try {
+    await conn.unsafe(`DELETE FROM file_migration_ledger`);
+  } catch (e: unknown) {
+    const code = (e as { code?: string })?.code;
+    if (code !== '42P01') throw e;
+  }
   return engine;
 }
 
